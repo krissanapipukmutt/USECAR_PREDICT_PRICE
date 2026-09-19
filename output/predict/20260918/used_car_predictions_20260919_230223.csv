@@ -1,0 +1,2 @@
+﻿MODEL_ID,TRAIN_PCS_DATE,brand,model,sub_model,model_year,mileage,fuel_type,engine_size,body_type,color,number_of_seats,PREDICTED_PRICE_THB,NEGATIVE_PREDICTION,brand_MODEL_CATEGORY,model_MODEL_CATEGORY,sub_model_MODEL_CATEGORY,fuel_type_MODEL_CATEGORY,body_type_MODEL_CATEGORY,color_MODEL_CATEGORY
+20260919_230223,2026-09-18,Toyota,CAMRY,G,2022,40000,Petrol,2.0,Sedan,White,5,835993.11,False,Toyota,CAMRY,G,Petrol,Sedan,White

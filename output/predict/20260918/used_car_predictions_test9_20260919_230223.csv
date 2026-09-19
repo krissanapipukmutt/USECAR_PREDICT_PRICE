@@ -1,0 +1,10 @@
+﻿MODEL_ID,TRAIN_PCS_DATE,listing_id,ACTUAL_PRICE,brand,model,sub_model,model_year,mileage,fuel_type,engine_size,body_type,color,number_of_seats,PREDICTED_PRICE_THB,NEGATIVE_PREDICTION,brand_MODEL_CATEGORY,model_MODEL_CATEGORY,sub_model_MODEL_CATEGORY,fuel_type_MODEL_CATEGORY,body_type_MODEL_CATEGORY,color_MODEL_CATEGORY
+20260919_230223,2026-09-18,19185686,209000,Honda,FREED,E,2010,375000,Petrol,1.5,Wagon,White,7.0,-160891.72,True,Honda,__OTHER__,E,Petrol,Wagon,White
+20260919_230223,2026-09-18,19233059,484000,Honda,City,RS,2024,47500,Petrol,1.0,Sedan,Black,4.0,501935.95,False,Honda,City,RS,Petrol,Sedan,Black
+20260919_230223,2026-09-18,19180448,399000,Honda,HR-V,EL,2017,227500,Petrol,1.8,SUV,Black,5.0,225448.31,False,Honda,HR-V,EL,Petrol,SUV,Black
+20260919_230223,2026-09-18,19229871,589000,Hyundai,H-1,Deluxe,2016,207500,Diesel,2.5,Van,Grey Bronze,12.0,421956.82,False,Hyundai,H-1,__OTHER__,Diesel,Van,Grey Bronze
+20260919_230223,2026-09-18,19227092,719000,Toyota,Yaris Cross,HEV Premium Luxury,2024,37500,Hybrid,1.5,SUV,Grey Bronze,5.0,724863.86,False,Toyota,__OTHER__,__OTHER__,Hybrid,SUV,Grey Bronze
+20260919_230223,2026-09-18,19166191,1059000,Toyota,FORTUNER,Leader G,2025,27500,Diesel,2.4,SUV,White,7.0,1181911.67,False,Toyota,FORTUNER,__OTHER__,Diesel,SUV,White
+20260919_230223,2026-09-18,19242157,3490000,Mercedes-Benz,S350,d AMG Premium,2022,72500,Diesel,2.9,Sedan,Silver Bronze,5.0,2324551.17,False,Mercedes-Benz,__OTHER__,__OTHER__,Diesel,Sedan,Silver Bronze
+20260919_230223,2026-09-18,19337168,4990000,Porsche,CAYENNE,E-Hybrid,2024,37500,Hybrid,3.0,Coupe,Grey Bronze,5.0,5362050.34,False,Porsche,__OTHER__,__OTHER__,Hybrid,Coupe,Grey Bronze
+20260919_230223,2026-09-18,19036938,38900000,MCLAREN,765LT,,2021,2500,Petrol,4.0,Coupe,Green,2.0,6756555.64,False,__OTHER__,__OTHER__,__MISSING__,Petrol,Coupe,Green

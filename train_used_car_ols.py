@@ -28,7 +28,7 @@ from sqlalchemy.engine import Engine
 # 1) ENVIRONMENT CONFIG
 # =============================================================================
 
-DB_SERVER = os.getenv("USED_CAR_DB_SERVER", "localhost")
+DB_SERVER = os.getenv("USED_CAR_DB_SERVER", "127.0.0.1")
 DB_PORT = int(os.getenv("USED_CAR_DB_PORT", "1433"))
 DB_DATABASE = os.getenv("USED_CAR_DB_DATABASE", "USED_CAR_DB")
 DB_USER = os.getenv("USED_CAR_DB_USER", "sa")
@@ -48,7 +48,7 @@ SOURCE_TABLE = os.getenv("USED_CAR_SOURCE_TABLE", "STG_USED_CAR")
 OUTPUT_DIR = Path(
     os.getenv(
         "USED_CAR_OUTPUT_DIR",
-        "/Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE/output",
+        "/Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE/output/train",
     )
 )
 
@@ -69,14 +69,45 @@ CONFIDENCE_LEVEL = 0.95
 CV_FOLDS = 5
 RANDOM_STATE = 42
 
-MAX_CANDIDATES = 14
+MAX_CANDIDATES = 8  # Keep the original baseline candidate feature combinations.
+# Add matched encoding experiments for the same source-feature sets (no new DB columns).
+MAX_EXPANDED_EXPERIMENTS = 2
 CANDIDATE_SUBSET_FRACTIONS = (0.90, 0.80, 0.70, 0.60, 0.50)
-CANDIDATES_PER_FRACTION = 2
+CANDIDATES_PER_FRACTION = 1
 
 MAX_MISSING_RATIO = 0.95
 MAX_CATEGORICAL_LEVELS = 60
 MAX_CATEGORICAL_UNIQUE_RATIO = 0.50
 MIN_CATEGORY_COUNT = 20
+
+# Brand/model are explicit vehicle attributes, not technical IDs. Allow them
+# through the initial schema checks even when distinct values exceed 60.
+CORE_VEHICLE_FEATURES = ("brand", "model")
+OPTIONAL_VEHICLE_FEATURES = ("sub_model",)
+# Hard caps prevent thousands of dummy columns and prohibit blind 2,000-level OLS.
+# The most frequent levels are retained; all remaining levels map to __OTHER__.
+MAX_LEVELS_BY_SOURCE = {"brand": 25, "model": 35, "sub_model": 15}
+MIN_COUNT_BY_SOURCE = {"brand": 20, "model": 30, "sub_model": 40}
+
+# V3 experiment: compare against V2 without changing the target, other source
+# columns, CV folds, output schema or prediction formula. These are TRAIN-only
+# frequency thresholds, not prices used to decide which categories survive.
+# Category levels for each fold are learned from that fold's TRAIN partition.
+ENCODING_PROFILES = {
+    "BASELINE": {
+        "max_levels": MAX_LEVELS_BY_SOURCE,
+        "min_count": MIN_COUNT_BY_SOURCE,
+    },
+    "EXPANDED_BRAND_MODEL": {
+        "max_levels": {**MAX_LEVELS_BY_SOURCE, "brand": 80, "model": 110},
+        "min_count": {**MIN_COUNT_BY_SOURCE, "brand": 5, "model": 10},
+    },
+}
+HIGH_PRICE_MIN_THB = 3_000_000  # Reporting only; not used to select levels.
+# Even when brand/model are available, their statistical significance is still
+# tested by the same source-feature group P-value rule as other predictors.
+# Optional sub_model is evaluated in separate candidates, never forced.
+
 NUMERIC_COERCE_THRESHOLD = 0.98
 
 REQUIRE_SINGLE_PCS_DATE = True
@@ -169,6 +200,12 @@ class PreprocessorState:
     feature_groups: Dict[str, List[str]]
 
 
+@dataclass(frozen=True)
+class CandidateExperiment:
+    source_features: List[str]
+    encoding_profile: str
+
+
 @dataclass
 class FinalCandidate:
     candidate_id: int
@@ -184,6 +221,10 @@ class FinalCandidate:
     f_statistic: Optional[float]
     f_p_value: Optional[float]
     source_feature_p_values: Dict[str, float]
+    encoding_profile: str = "BASELINE"
+    cv_high_price_mae: Optional[float] = None
+    cv_negative_rate: Optional[float] = None
+    cv_model_other_rate: Optional[float] = None
 
 
 def build_engine() -> Engine:
@@ -391,6 +432,10 @@ def infer_eligible_features(df: pd.DataFrame) -> Tuple[List[str], List[Tuple[str
 
         unique_ratio = unique_count / max(len(non_null), 1)
 
+        if lower in CORE_VEHICLE_FEATURES or lower in OPTIONAL_VEHICLE_FEATURES:
+            eligible.append(col)
+            continue
+
         if unique_count > MAX_CATEGORICAL_LEVELS:
             excluded.append((col, f"high_cardinality_levels={unique_count}"))
             continue
@@ -433,7 +478,11 @@ def deterministic_reference(counts: pd.Series) -> str:
 def fit_preprocessor(
     df: pd.DataFrame,
     source_features: Sequence[str],
+    encoding_profile: str = "BASELINE",
 ) -> PreprocessorState:
+    if encoding_profile not in ENCODING_PROFILES:
+        raise ValueError(f"Unknown encoding profile: {encoding_profile}")
+    profile = ENCODING_PROFILES[encoding_profile]
     numeric_features = []
     categorical_features = []
     numeric_medians: Dict[str, float] = {}
@@ -458,17 +507,20 @@ def fit_preprocessor(
         values = normalize_category_series(s)
         counts = values.value_counts(dropna=False)
 
-        rare_levels = set(
-            counts[counts < MIN_CATEGORY_COUNT].index.astype(str)
-        )
-        if rare_levels:
-            values = values.where(
-                ~values.isin(rare_levels),
-                "__OTHER__",
-            )
-            counts = values.value_counts(dropna=False)
-
+        # Learn frequency grouping ONLY on the training partition. Future
+        # observations use the exact same stored category levels and OTHER rule.
+        minimum = profile["min_count"].get(col.lower(), MIN_CATEGORY_COUNT)
+        max_levels = profile["max_levels"].get(col.lower(), MAX_CATEGORICAL_LEVELS)
+        frequent = counts[counts >= minimum]
+        # Reserve a slot for __OTHER__, including new categories at prediction.
+        retained = [str(v) for v in frequent.index if str(v) != "__OTHER__"][:max_levels - 1]
+        if not retained:
+            retained = [str(counts.index[0])]
+        if "__OTHER__" not in retained:
+            values = values.where(values.isin(retained), "__OTHER__")
+        counts = values.value_counts(dropna=False)
         levels = [str(x) for x in counts.index.tolist()]
+
         if len(levels) <= 1:
             continue
 
@@ -516,32 +568,33 @@ def transform_with_preprocessor(
     df: pd.DataFrame,
     state: PreprocessorState,
 ) -> pd.DataFrame:
-    output = pd.DataFrame(index=df.index)
+    # Construct encoded columns in one pass to avoid highly fragmented Frames.
+    # Preserve the V2 names, reference-category behavior and column ordering.
+    encoded: Dict[str, pd.Series] = {}
 
     for col in state.numeric_features:
         values = pd.to_numeric(df[col], errors="coerce").astype(float)
         values = values.replace([np.inf, -np.inf], np.nan)
-        output[col] = values.fillna(state.numeric_medians[col])
+        encoded[col] = values.fillna(state.numeric_medians[col])
 
     for col in state.categorical_features:
         values = normalize_category_series(df[col])
-
         levels = state.category_levels[col]
         reference = state.reference_categories[col]
         fallback = "__OTHER__" if "__OTHER__" in levels else reference
         values = values.where(values.isin(levels), fallback)
 
         for level in levels:
-            if level == reference:
-                continue
-            feature_name = safe_feature_name(col, level)
-            output[feature_name] = (values == level).astype(float)
+            if level != reference:
+                encoded[safe_feature_name(col, level)] = (values == level).astype(float)
 
-    for col in state.encoded_feature_names:
-        if col not in output.columns:
-            output[col] = 0.0
-
-    return output[state.encoded_feature_names].astype(float)
+    if not state.encoded_feature_names:
+        return pd.DataFrame(index=df.index)
+    return pd.DataFrame(
+        {name: encoded.get(name, pd.Series(0.0, index=df.index))
+         for name in state.encoded_feature_names},
+        index=df.index,
+    ).astype(float)
 
 
 def fit_ols(X: pd.DataFrame, y: pd.Series):
@@ -653,71 +706,68 @@ def backward_eliminate_source_features(
 def generate_candidate_feature_sets(
     all_features: Sequence[str],
 ) -> List[List[str]]:
-    features = list(all_features)
-    if not features:
-        return []
+    """Compare vehicle feature combinations, not arbitrary core-feature drops.
 
-    target_candidate_count = max(
-        TOP_N_MODELS * 3,
-        min(MAX_CANDIDATES, 6),
-    )
-    target_candidate_count = min(MAX_CANDIDATES, target_candidate_count)
-
-    candidates: List[Tuple[str, ...]] = []
+    Sub-model is optional; candidate sets include brand + model, brand only,
+    model only, and (when present) a version with sub-model. Other source
+    features remain dynamically discovered from today's Alice schema.
+    """
+    features = list(dict.fromkeys(all_features))
+    by_lower = {c.lower(): c for c in features}
+    brand = by_lower.get("brand")
+    model = by_lower.get("model")
+    sub_model = by_lower.get("sub_model")
+    core = [c for c in (brand, model) if c]
+    optional = [sub_model] if sub_model else []
+    other = [c for c in features if c not in core + optional]
+    sets: List[List[str]] = []
     seen = set()
 
-    def add_candidate(cols: Sequence[str]):
-        key = tuple(sorted(set(cols)))
-        if len(key) < MIN_SOURCE_FEATURES:
-            return
-        if key not in seen:
+    def add(items):
+        cols = list(dict.fromkeys(c for c in items if c))
+        key = tuple(sorted(cols))
+        if cols and key not in seen:
             seen.add(key)
-            candidates.append(key)
+            sets.append(cols)
 
-    add_candidate(features)
+    # The first four deliberately test the importance of brand and model.
+    add(core + other)
+    add(core + optional + other)
+    if brand:
+        add([brand] + other)
+    if model:
+        add([model] + other)
+    # Test whether a smaller supplementary feature set generalizes better.
     rng = np.random.default_rng(RANDOM_STATE)
+    for fraction in (0.85, 0.65, 0.45):
+        k = max(1, int(math.ceil(len(other) * fraction))) if other else 0
+        picked = rng.choice(other, size=k, replace=False).tolist() if k else []
+        add(core + picked)
+        add(core + optional + picked)
+    return sets[:MAX_CANDIDATES]
 
-    for fraction in CANDIDATE_SUBSET_FRACTIONS:
-        subset_size = max(
-            MIN_SOURCE_FEATURES,
-            int(math.ceil(len(features) * fraction)),
-        )
-        subset_size = min(subset_size, len(features))
 
-        for _ in range(CANDIDATES_PER_FRACTION):
-            if subset_size == len(features):
-                add_candidate(features)
-                continue
+def build_candidate_experiments(all_features: Sequence[str]) -> List[CandidateExperiment]:
+    """Pair BASELINE and EXPANDED on exactly the same source feature sets.
 
-            subset = rng.choice(
-                features,
-                size=subset_size,
-                replace=False,
-            ).tolist()
-            add_candidate(subset)
-
-            if len(candidates) >= target_candidate_count:
-                break
-
-        if len(candidates) >= target_candidate_count:
-            break
-
-    if len(candidates) < target_candidate_count and len(features) > 1:
-        shuffled = list(features)
-        rng.shuffle(shuffled)
-
-        for drop_col in shuffled:
-            add_candidate([c for c in features if c != drop_col])
-            if len(candidates) >= target_candidate_count:
-                break
-
-    return [list(x) for x in candidates[:MAX_CANDIDATES]]
+    Keep the V2 baseline search (8 sets) and add expanded versions of the
+    first two sets (brand+model, with/without optional sub_model). This allows
+    direct, fold-matched encoding comparisons without changing price filtering.
+    """
+    baseline_sets = generate_candidate_feature_sets(all_features)
+    experiments = [CandidateExperiment(features, "BASELINE") for features in baseline_sets]
+    for features in baseline_sets[:MAX_EXPANDED_EXPERIMENTS]:
+        experiments.append(CandidateExperiment(features, "EXPANDED_BRAND_MODEL"))
+    return experiments
 
 
 def evaluate_candidate_cv(
     df: pd.DataFrame,
     initial_source_features: Sequence[str],
-) -> Tuple[float, float]:
+    encoding_profile: str = "BASELINE",
+) -> Tuple[float, float, Optional[float], float, Optional[float]]:
+    # Return fold-mean RMSE/MAE as before plus out-of-fold diagnostics.
+    # HIGH_PRICE_MIN_THB and __OTHER__ are diagnostics, not candidate ranking rules.
     y_all = df[TARGET_COLUMN].astype(float)
 
     kfold = KFold(
@@ -728,6 +778,11 @@ def evaluate_candidate_cv(
 
     rmses: List[float] = []
     maes: List[float] = []
+    tail_absolute_errors: List[np.ndarray] = []
+    negative_predictions = 0
+    n_validated = 0
+    other_model_count = 0
+    n_model_mapped = 0
 
     for train_idx, valid_idx in kfold.split(df):
         train_df = df.iloc[train_idx]
@@ -736,7 +791,7 @@ def evaluate_candidate_cv(
         y_train = y_all.iloc[train_idx]
         y_valid = y_all.iloc[valid_idx]
 
-        state = fit_preprocessor(train_df, initial_source_features)
+        state = fit_preprocessor(train_df, initial_source_features, encoding_profile)
 
         X_train = transform_with_preprocessor(train_df, state)
         X_valid = transform_with_preprocessor(valid_df, state)
@@ -768,7 +823,27 @@ def evaluate_candidate_cv(
         rmses.append(float(rmse))
         maes.append(float(mae))
 
-    return float(np.mean(rmses)), float(np.mean(maes))
+        y_np = y_valid.to_numpy(dtype=float)
+        tail = y_np >= HIGH_PRICE_MIN_THB
+        if tail.any():
+            tail_absolute_errors.append(np.abs(y_np[tail] - pred[tail]))
+        negative_predictions += int((pred < 0).sum())
+        n_validated += len(pred)
+        model_col = next((col for col in state.categorical_features
+                          if col.lower() == "model"), None)
+        if model_col:
+            values = normalize_category_series(valid_df[model_col])
+            levels = state.category_levels[model_col]
+            fallback = "__OTHER__" if "__OTHER__" in levels else state.reference_categories[model_col]
+            mapped = values.where(values.isin(levels), fallback)
+            other_model_count += int(mapped.eq("__OTHER__").sum())
+            n_model_mapped += len(mapped)
+
+    high_price_mae = (float(np.concatenate(tail_absolute_errors).mean())
+                      if tail_absolute_errors else None)
+    other_rate = other_model_count / n_model_mapped if n_model_mapped else None
+    return (float(np.mean(rmses)), float(np.mean(maes)), high_price_mae,
+            negative_predictions / n_validated, other_rate)
 
 
 def fit_final_candidate(
@@ -777,8 +852,12 @@ def fit_final_candidate(
     initial_source_features: Sequence[str],
     cv_rmse: float,
     cv_mae: float,
+    encoding_profile: str = "BASELINE",
+    cv_high_price_mae: Optional[float] = None,
+    cv_negative_rate: Optional[float] = None,
+    cv_model_other_rate: Optional[float] = None,
 ) -> FinalCandidate:
-    state = fit_preprocessor(df, initial_source_features)
+    state = fit_preprocessor(df, initial_source_features, encoding_profile)
 
     X = transform_with_preprocessor(df, state)
     y = df[TARGET_COLUMN].astype(float)
@@ -820,6 +899,10 @@ def fit_final_candidate(
         f_statistic=f_stat,
         f_p_value=f_p,
         source_feature_p_values=source_feature_p_values,
+        encoding_profile=encoding_profile,
+        cv_high_price_mae=cv_high_price_mae,
+        cv_negative_rate=cv_negative_rate,
+        cv_model_other_rate=cv_model_other_rate,
     )
 
 
@@ -829,7 +912,14 @@ def rank_candidates(
     best_by_structure: Dict[Tuple[str, ...], FinalCandidate] = {}
 
     for candidate in candidates:
-        structure = tuple(sorted(candidate.selected_source_features))
+        # Different retained levels => genuinely different encoders/models,
+        # even when the selected source column names happen to be identical.
+        selected = candidate.selected_source_features
+        structure = (
+            tuple(sorted(selected)),
+            tuple(sorted((col, tuple(candidate.preprocessor.category_levels.get(col, [])))
+                         for col in selected)),
+        )
 
         if structure not in best_by_structure:
             best_by_structure[structure] = candidate
@@ -1099,6 +1189,8 @@ def build_top1_model_bundle(
 
     bundle = {
         "artifact_version": "1.0",
+        "encoding_profile": top_candidate.encoding_profile,
+        "encoding_config": ENCODING_PROFILES[top_candidate.encoding_profile],
         "run_id": run_id,
         "model_id": model_id,
         "model_rank": 1,
@@ -1151,7 +1243,7 @@ def main() -> None:
     print(f"[CONFIG] P-value    : <= {P_VALUE_THRESHOLD}")
     print(f"[CONFIG] Confidence : {CONFIDENCE_LEVEL:.0%}")
     print(f"[CONFIG] CV folds   : {CV_FOLDS}")
-    print(f"[CONFIG] Output     : {OUTPUT_DIR.resolve()}")
+    print(f"[CONFIG] Output base: {OUTPUT_DIR.resolve()}")
 
     engine = build_engine()
 
@@ -1186,9 +1278,14 @@ def main() -> None:
         for col, reason in excluded_info:
             print(f"       - {col}: {reason}")
 
-    initial_candidates = generate_candidate_feature_sets(
-        eligible_features
-    )
+    initial_candidates = build_candidate_experiments(eligible_features)
+    print("[INFO] Core vehicle features detected:",
+          [c for c in eligible_features if c.lower() in CORE_VEHICLE_FEATURES])
+    print("[INFO] Optional sub-model detected:",
+          [c for c in eligible_features if c.lower() in OPTIONAL_VEHICLE_FEATURES])
+    print("[INFO] Baseline category limits:", ENCODING_PROFILES["BASELINE"])
+    print("[INFO] Expanded category limits:", ENCODING_PROFILES["EXPANDED_BRAND_MODEL"])
+    print("[INFO] High-price cutoff (CV diagnostics only):", f"{HIGH_PRICE_MIN_THB:,.0f} THB")
 
     if len(initial_candidates) < TOP_N_MODELS:
         raise RuntimeError(
@@ -1202,19 +1299,18 @@ def main() -> None:
 
     fitted_candidates: List[FinalCandidate] = []
 
-    for candidate_id, feature_set in enumerate(
-        initial_candidates,
-        start=1,
-    ):
+    paired_results = {}
+    for candidate_id, experiment in enumerate(initial_candidates, start=1):
+        feature_set = experiment.source_features
+        profile = experiment.encoding_profile
         print(
             f"[TRAIN] Candidate {candidate_id}/{len(initial_candidates)} "
-            f"({len(feature_set)} source features)"
+            f"profile={profile} ({len(feature_set)} source features)"
         )
 
         try:
-            cv_rmse, cv_mae = evaluate_candidate_cv(
-                df,
-                feature_set,
+            cv_rmse, cv_mae, tail_mae, negative_rate, model_other_rate = evaluate_candidate_cv(
+                df, feature_set, profile,
             )
 
             final_candidate = fit_final_candidate(
@@ -1223,22 +1319,50 @@ def main() -> None:
                 initial_source_features=feature_set,
                 cv_rmse=cv_rmse,
                 cv_mae=cv_mae,
+                encoding_profile=profile,
+                cv_high_price_mae=tail_mae,
+                cv_negative_rate=negative_rate,
+                cv_model_other_rate=model_other_rate,
             )
 
             fitted_candidates.append(final_candidate)
+            paired_results[(tuple(feature_set), profile)] = final_candidate
 
             print(
                 f"        CV_RMSE={cv_rmse:,.2f} | "
                 f"CV_MAE={cv_mae:,.2f} | "
                 f"Adj_R2={final_candidate.adj_r_squared:.6f} | "
                 f"SelectedFeatures="
-                f"{len(final_candidate.selected_source_features)}"
+                f"{len(final_candidate.selected_source_features)} | "
+                f"VehicleFeatures="
+                f"{[c for c in final_candidate.selected_source_features if c.lower() in CORE_VEHICLE_FEATURES + OPTIONAL_VEHICLE_FEATURES]}"
+            )
+            print(
+                f"        OOF MAE(>= {HIGH_PRICE_MIN_THB:,.0f}THB)="
+                f"{tail_mae if tail_mae is not None else float('nan'):,.0f} | "
+                f"OOF Negative={negative_rate:.2%} | "
+                f"OOF model=__OTHER__={model_other_rate:.2%}"
+                if model_other_rate is not None else
+                f"        OOF MAE(>= {HIGH_PRICE_MIN_THB:,.0f}THB)="
+                f"{tail_mae if tail_mae is not None else float('nan'):,.0f} | "
+                f"OOF Negative={negative_rate:.2%} | OOF model category=N/A"
             )
 
         except Exception as exc:
             print(
                 f"[WARN] Candidate {candidate_id} skipped: {exc}"
             )
+
+    print("\n[COMPARISON] Paired BASELINE vs EXPANDED (same feature sets and CV folds):")
+    for base_features in generate_candidate_feature_sets(eligible_features)[:MAX_EXPANDED_EXPERIMENTS]:
+        b = paired_results.get((tuple(base_features), "BASELINE"))
+        e = paired_results.get((tuple(base_features), "EXPANDED_BRAND_MODEL"))
+        if b is not None and e is not None:
+            print(f"  Features: {', '.join(base_features)}")
+            print(f"  BASELINE RMSE={b.cv_rmse:,.2f}, MAE={b.cv_mae:,.2f}, "
+                  f"tail_MAE={b.cv_high_price_mae}, model_OTHER={b.cv_model_other_rate}")
+            print(f"  EXPANDED RMSE={e.cv_rmse:,.2f}, MAE={e.cv_mae:,.2f}, "
+                  f"tail_MAE={e.cv_high_price_mae}, model_OTHER={e.cv_model_other_rate}")
 
     if not fitted_candidates:
         raise RuntimeError(
@@ -1255,10 +1379,9 @@ def main() -> None:
 
     top_candidates = ranked[:TOP_N_MODELS]
 
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    # Organize artifacts by the actual STG snapshot PCS_DATE (YYYYMMDD).
+    run_output_dir = OUTPUT_DIR / pcs_date.strftime("%Y%m%d")
+    run_output_dir.mkdir(parents=True, exist_ok=True)
 
     result_df, model_ids = build_result_dataframe(
         top_candidates=top_candidates,
@@ -1274,15 +1397,15 @@ def main() -> None:
     )
 
     result_path = (
-        OUTPUT_DIR
+        run_output_dir
         / f"OLS_REGRESSION_RESULT_{run_id}.csv"
     )
     coefficient_path = (
-        OUTPUT_DIR
+        run_output_dir
         / f"OLS_REGRESSION_COEFFICIENT_{run_id}.csv"
     )
     joblib_path = (
-        OUTPUT_DIR
+        run_output_dir
         / f"used_car_models_{run_id}.joblib"
     )
 
@@ -1323,6 +1446,7 @@ def main() -> None:
 
         print(
             f"Rank {rank}: MODEL_ID={model_id} | "
+            f"ENCODING={candidate.encoding_profile} | "
             f"RMSE={candidate.cv_rmse:,.2f} | "
             f"MAE={candidate.cv_mae:,.2f} | "
             f"Adj_R2={candidate.adj_r_squared:.6f}"
