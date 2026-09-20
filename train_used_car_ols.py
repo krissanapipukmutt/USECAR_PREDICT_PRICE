@@ -104,6 +104,29 @@ ENCODING_PROFILES = {
     },
 }
 HIGH_PRICE_MIN_THB = 3_000_000  # Reporting only; not used to select levels.
+
+# Price-quality screening is FLAG-ONLY: NEVER remove rows on this basis.
+# Review suspect prices with source listings before approving exclusion rules.
+OUTLIER_FLAG_ONLY = True
+OUTLIER_MIN_GROUP_SIZE = 15
+OUTLIER_LOW_PRICE_REVIEW_THB = 1_000.0
+OUTLIER_MODIFIED_Z_THRESHOLD = 3.5
+OUTLIER_PRICE_RATIO_THRESHOLD = 3.0
+OUTLIER_LOG_MAD_FLOOR = 0.10  # Prevent tiny/zero MAD from excessive flags.
+# Broad brand+model groups are used only if their training years span <= 3.
+OUTLIER_MAX_BROAD_GROUP_YEAR_SPAN = 3
+OUTLIER_REPORT_BASE_DIR = OUTPUT_DIR.parent / "analysis"
+
+# Price-filter experiment: BASELINE retains every valid positive target;
+# EXPERIMENT removes price <= 1,000 THB and explicitly confirmed bad listing
+# IDs from TRAINING partitions ONLY. Outlier flags never trigger exclusion.
+# Change via shell: USED_CAR_PRICE_FILTER_MODE=EXPERIMENT python3 train_used_car_ols.py
+PRICE_FILTER_MODE = os.getenv("USED_CAR_PRICE_FILTER_MODE", "BASELINE").strip().upper()
+PRICE_FILTER_MAX_THB = 1_000.0
+# Specify confirmed erroneous listings ONLY after checking the source listing.
+# Strings preserve any leading zeros in listing_id.
+CONFIRMED_BAD_LISTING_IDS: List[str] = []
+PRICE_SELECTION_REPORT_BASE_DIR = OUTPUT_DIR.parent / "analysis"
 # Even when brand/model are available, their statistical significance is still
 # tested by the same source-feature group P-value rule as other predictors.
 # Optional sub_model is evaluated in separate candidates, never forced.
@@ -225,6 +248,9 @@ class FinalCandidate:
     cv_high_price_mae: Optional[float] = None
     cv_negative_rate: Optional[float] = None
     cv_model_other_rate: Optional[float] = None
+    cv_eligible_rmse: Optional[float] = None
+    cv_eligible_mae: Optional[float] = None
+    cv_eligible_count: int = 0
 
 
 def build_engine() -> Engine:
@@ -310,6 +336,170 @@ def parse_single_pcs_date(df: pd.DataFrame) -> pd.Timestamp:
     return pd.Timestamp(unique_dates[-1])
 
 
+def build_group_price_outlier_report(source_df: pd.DataFrame) -> pd.DataFrame:
+    """Audit the STG snapshot without modifying it or choosing training rows.
+
+    Reference-group statistics use positive prices > OUTLIER_LOW_PRICE_REVIEW_THB
+    to avoid 1-THB placeholders distorting medians. This report is exploratory,
+    not a validation metric or proof that any particular listing is wrong.
+    """
+    if not OUTLIER_FLAG_ONLY:
+        raise ValueError("Only FLAG-ONLY price screening is implemented.")
+    if OUTLIER_MIN_GROUP_SIZE < 3:
+        raise ValueError("OUTLIER_MIN_GROUP_SIZE must be at least 3.")
+    if OUTLIER_PRICE_RATIO_THRESHOLD <= 1 or OUTLIER_LOG_MAD_FLOOR <= 0:
+        raise ValueError("Outlier ratio and MAD floor must be positive/valid.")
+
+    n = len(source_df)
+    report = pd.DataFrame(index=source_df.index)
+    report["SOURCE_ROW_NUMBER"] = np.arange(1, n + 1, dtype=int)
+
+    metadata = ["listing_id", "brand", "model", "sub_model",
+                "model_year", "raw_price", "title", "source_url"]
+    for label in metadata:
+        actual = find_column_case_insensitive(source_df.columns, label)
+        report[label] = source_df[actual] if actual is not None else pd.NA
+
+    # Preserve the originally supplied target and DO NOT mutate source_df.
+    raw_price = source_df[TARGET_COLUMN]
+    if pd.api.types.is_object_dtype(raw_price) or pd.api.types.is_string_dtype(raw_price):
+        raw_price = raw_price.astype("string").str.replace(",", "", regex=False).str.strip()
+    price = pd.to_numeric(raw_price, errors="coerce").astype("float64")
+    price = price.replace([np.inf, -np.inf], np.nan)
+    report["price"] = price
+    report["STATUS"] = "INSUFFICIENT_GROUP_DATA"
+    report["REASON"] = "NO_RELIABLE_COMPARISON_GROUP"
+    report["GROUP_USED"] = pd.NA
+    report["GROUP_SIZE"] = pd.Series(pd.NA, index=report.index, dtype="Int64")
+    for label in ["GROUP_MEDIAN_PRICE", "GROUP_LOG_MAD", "PRICE_TO_MEDIAN_RATIO",
+                  "MODIFIED_Z_SCORE"]:
+        report[label] = np.nan
+
+    missing_or_invalid = price.isna() | (price <= 0)
+    report.loc[missing_or_invalid, "STATUS"] = "SUSPECTED_OUTLIER"
+    report.loc[missing_or_invalid, "REASON"] = "INVALID_OR_NONPOSITIVE_PRICE"
+    low = (~missing_or_invalid) & (price <= OUTLIER_LOW_PRICE_REVIEW_THB)
+    report.loc[low, "STATUS"] = "SUSPECTED_OUTLIER"
+    report.loc[low, "REASON"] = "VERY_LOW_PRICE_REVIEW"
+
+    keys = pd.DataFrame(index=source_df.index)
+    for key in ("brand", "model", "sub_model"):
+        actual = find_column_case_insensitive(source_df.columns, key)
+        if actual is None:
+            keys[key] = pd.Series(pd.NA, index=source_df.index, dtype="string")
+        else:
+            values = source_df[actual].astype("string").str.strip().str.casefold()
+            keys[key] = values.mask(values.isin(["", "nan", "none", "null", "__missing__"]))
+    year_actual = find_column_case_insensitive(source_df.columns, "model_year")
+    if year_actual is not None:
+        keys["model_year"] = pd.to_numeric(source_df[year_actual], errors="coerce")
+    else:
+        keys["model_year"] = np.nan
+
+    remaining = (~missing_or_invalid) & (~low)
+    if not remaining.any():
+        return report
+
+    ref = keys.copy()
+    ref["__log_price"] = np.log(price.where(price > OUTLIER_LOW_PRICE_REVIEW_THB))
+    ref = ref.loc[ref["__log_price"].notna()].copy()
+
+    levels = [
+        ("BRAND_MODEL_SUB_MODEL_YEAR", ["brand", "model", "sub_model", "model_year"]),
+        ("BRAND_MODEL_YEAR", ["brand", "model", "model_year"]),
+        ("BRAND_MODEL", ["brand", "model"]),
+    ]
+    for label, group_cols in levels:
+        if not remaining.any() or ref.empty:
+            break
+        # Missing group fields cannot form a reliable peer cohort.
+        eligible_ref = ref.dropna(subset=group_cols).copy()
+        if eligible_ref.empty:
+            continue
+        grouped = eligible_ref.groupby(group_cols, dropna=True, sort=False)
+        stats = grouped["__log_price"].agg(
+            GROUP_SIZE="size", GROUP_LOG_MEDIAN="median"
+        ).reset_index()
+        eligible_ref = eligible_ref.merge(stats, on=group_cols, how="left", validate="many_to_one")
+        eligible_ref["__abs_dev"] = (
+            eligible_ref["__log_price"] - eligible_ref["GROUP_LOG_MEDIAN"]
+        ).abs()
+        deviations = (eligible_ref.groupby(group_cols, dropna=True, sort=False)["__abs_dev"]
+                      .median().rename("GROUP_LOG_MAD").reset_index())
+        stats = stats.merge(deviations, on=group_cols, how="left", validate="one_to_one")
+        if label == "BRAND_MODEL":
+            # A broad model group may include cars of radically different ages.
+            year_span = (eligible_ref.groupby(group_cols, dropna=True, sort=False)["model_year"]
+                         .agg(lambda x: x.max() - x.min() if x.notna().any() else np.nan)
+                         .rename("YEAR_SPAN").reset_index())
+            stats = stats.merge(year_span, on=group_cols, how="left", validate="one_to_one")
+        candidates = keys.loc[remaining, group_cols].copy()
+        candidates["__row_index"] = candidates.index
+        candidates = candidates.dropna(subset=group_cols)
+        if candidates.empty:
+            continue
+        candidates = candidates.merge(stats, on=group_cols, how="left", validate="many_to_one")
+        valid = candidates["GROUP_SIZE"].ge(OUTLIER_MIN_GROUP_SIZE).fillna(False)
+        if label == "BRAND_MODEL":
+            valid &= candidates["YEAR_SPAN"].le(OUTLIER_MAX_BROAD_GROUP_YEAR_SPAN).fillna(False)
+        matched = candidates.loc[valid].set_index("__row_index")
+        if matched.empty:
+            continue
+        ix = matched.index
+        median_log = matched["GROUP_LOG_MEDIAN"].to_numpy(float)
+        observed = price.loc[ix].to_numpy(float)
+        ratio = np.exp(np.log(observed) - median_log)
+        z_score = (0.6745 * (np.log(observed) - median_log) /
+                   np.maximum(matched["GROUP_LOG_MAD"].to_numpy(float), OUTLIER_LOG_MAD_FLOOR))
+        suspicious_high = ((z_score > OUTLIER_MODIFIED_Z_THRESHOLD) &
+                           (ratio >= OUTLIER_PRICE_RATIO_THRESHOLD))
+        suspicious_low = ((z_score < -OUTLIER_MODIFIED_Z_THRESHOLD) &
+                          (ratio <= 1.0 / OUTLIER_PRICE_RATIO_THRESHOLD))
+
+        report.loc[ix, "STATUS"] = "NORMAL"
+        report.loc[ix, "REASON"] = "WITHIN_PEER_GROUP_THRESHOLD"
+        report.loc[ix, "GROUP_USED"] = label
+        report.loc[ix, "GROUP_SIZE"] = matched["GROUP_SIZE"].astype("int64")
+        report.loc[ix, "GROUP_MEDIAN_PRICE"] = np.exp(median_log)
+        report.loc[ix, "GROUP_LOG_MAD"] = matched["GROUP_LOG_MAD"].to_numpy(float)
+        report.loc[ix, "PRICE_TO_MEDIAN_RATIO"] = ratio
+        report.loc[ix, "MODIFIED_Z_SCORE"] = z_score
+        if suspicious_high.any():
+            hi_ix = ix[suspicious_high]
+            report.loc[hi_ix, "STATUS"] = "SUSPECTED_OUTLIER"
+            report.loc[hi_ix, "REASON"] = "PRICE_HIGH_VS_PEERS"
+        if suspicious_low.any():
+            lo_ix = ix[suspicious_low]
+            report.loc[lo_ix, "STATUS"] = "SUSPECTED_OUTLIER"
+            report.loc[lo_ix, "REASON"] = "PRICE_LOW_VS_PEERS"
+        remaining.loc[ix] = False
+
+    return report
+
+
+def export_outlier_flag_only_reports(
+    source_df: pd.DataFrame, pcs_date: pd.Timestamp, run_id: str
+) -> Tuple[Path, Path]:
+    """Write audit files outside train/. Return all-rows and flagged-only paths."""
+    report = build_group_price_outlier_report(source_df)
+    output_dir = OUTLIER_REPORT_BASE_DIR / pcs_date.strftime("%Y%m%d")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    all_path = output_dir / f"price_quality_all_{run_id}.csv"
+    flagged_path = output_dir / f"price_outliers_for_review_{run_id}.csv"
+    report.to_csv(all_path, index=False, encoding="utf-8-sig")
+    flagged = report.loc[report["STATUS"].eq("SUSPECTED_OUTLIER")].copy()
+    flagged.to_csv(flagged_path, index=False, encoding="utf-8-sig")
+    print("[PRICE QUALITY] FLAG-ONLY screening (no training rows removed):")
+    for status, count in report["STATUS"].value_counts(dropna=False).items():
+        print(f"    {status}: {count:,}")
+    print("[PRICE QUALITY] Reasons:")
+    for reason, count in report["REASON"].value_counts(dropna=False).items():
+        print(f"    {reason}: {count:,}")
+    print(f"[PRICE QUALITY] Full audit: {all_path}")
+    print(f"[PRICE QUALITY] Review list: {flagged_path}")
+    return all_path, flagged_path
+
+
 def clean_target(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df[TARGET_COLUMN] = pd.to_numeric(df[TARGET_COLUMN], errors="coerce")
@@ -335,6 +525,89 @@ def clean_target(df: pd.DataFrame) -> pd.DataFrame:
         )
 
     return df
+
+
+def price_filter_exclusion_reason(df: pd.DataFrame) -> pd.Series:
+    """Return row-level TRAIN-only exclusion reasons without modifying df.
+
+    BASELINE intentionally ignores the experimental filters. EXPERIMENT
+    excludes price <= PRICE_FILTER_MAX_THB or explicitly confirmed bad IDs.
+    Suspected peer outliers are never excluded by this function.
+    """
+    if PRICE_FILTER_MODE not in {"BASELINE", "EXPERIMENT"}:
+        raise ValueError("PRICE_FILTER_MODE must be BASELINE or EXPERIMENT.")
+    if not np.isfinite(PRICE_FILTER_MAX_THB) or PRICE_FILTER_MAX_THB <= 0:
+        raise ValueError("PRICE_FILTER_MAX_THB must be positive and finite.")
+
+    reasons = pd.Series("", index=df.index, dtype="string")
+    if PRICE_FILTER_MODE == "BASELINE":
+        return reasons
+
+    prices = pd.to_numeric(df[TARGET_COLUMN], errors="coerce")
+    reasons.loc[prices.le(PRICE_FILTER_MAX_THB)] = (
+        f"PRICE_LE_{PRICE_FILTER_MAX_THB:g}_THB_EXPERIMENT"
+    )
+    if CONFIRMED_BAD_LISTING_IDS:
+        listing_col = find_column_case_insensitive(df.columns, "listing_id")
+        if listing_col is None:
+            raise RuntimeError("CONFIRMED_BAD_LISTING_IDS was set but listing_id is absent.")
+        confirmed = {str(value).strip() for value in CONFIRMED_BAD_LISTING_IDS}
+        if "" in confirmed:
+            raise ValueError("CONFIRMED_BAD_LISTING_IDS cannot contain empty IDs.")
+        ids = df[listing_col].astype("string").str.strip()
+        flagged = ids.isin(confirmed)
+        both = flagged & reasons.ne("")
+        reasons.loc[flagged & ~both] = "CONFIRMED_BAD_LISTING_ID"
+        reasons.loc[both] = reasons.loc[both] + ";CONFIRMED_BAD_LISTING_ID"
+    return reasons
+
+
+def select_train_rows(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+    """Apply the same rule to final fit and to each CV TRAIN fold."""
+    reasons = price_filter_exclusion_reason(df)
+    selected = df.loc[reasons.eq("")].copy()
+    if len(selected) < max(30, CV_FOLDS * 5):
+        raise RuntimeError(
+            f"PRICE_FILTER_MODE={PRICE_FILTER_MODE}: only {len(selected):,} "
+            "training rows remain; aborting."
+        )
+    return selected, reasons
+
+
+def price_filter_eligible_validation_mask(df: pd.DataFrame) -> pd.Series:
+    """Same operational evaluation cohort across BASELINE and EXPERIMENT."""
+    eligible = pd.to_numeric(df[TARGET_COLUMN], errors="coerce").gt(PRICE_FILTER_MAX_THB)
+    if CONFIRMED_BAD_LISTING_IDS:
+        listing_col = find_column_case_insensitive(df.columns, "listing_id")
+        if listing_col is None:
+            raise RuntimeError("CONFIRMED_BAD_LISTING_IDS was set but listing_id is absent.")
+        confirmed = {str(value).strip() for value in CONFIRMED_BAD_LISTING_IDS}
+        eligible &= ~df[listing_col].astype("string").str.strip().isin(confirmed)
+    return eligible.fillna(False)
+
+
+def export_train_row_selection_report(
+    cleaned_df: pd.DataFrame, reasons: pd.Series,
+    pcs_date: pd.Timestamp, run_id: str,
+) -> Path:
+    """Audit the final-fit row selection without changing the source table."""
+    report = pd.DataFrame(index=cleaned_df.index)
+    report["SOURCE_ROW_NUMBER"] = cleaned_df.index.to_numpy() + 1
+    listing_col = find_column_case_insensitive(cleaned_df.columns, "listing_id")
+    report["listing_id"] = (
+        cleaned_df[listing_col] if listing_col is not None else pd.NA
+    )
+    report["price"] = cleaned_df[TARGET_COLUMN]
+    report["PRICE_FILTER_MODE"] = PRICE_FILTER_MODE
+    report["USED_FOR_TRAIN"] = np.where(reasons.eq(""), "Y", "N")
+    report["EXCLUSION_REASON"] = reasons.to_numpy()
+    report["PCS_DATE"] = pcs_date.date().isoformat()
+    report_dir = PRICE_SELECTION_REPORT_BASE_DIR / pcs_date.strftime("%Y%m%d")
+    report_dir.mkdir(parents=True, exist_ok=True)
+    output_path = report_dir / f"train_row_selection_{run_id}.csv"
+    report.to_csv(output_path, index=False, encoding="utf-8-sig")
+    print(f"[PRICE FILTER] Training row audit: {output_path}")
+    return output_path
 
 
 def maybe_convert_numeric_like_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -765,7 +1038,9 @@ def evaluate_candidate_cv(
     df: pd.DataFrame,
     initial_source_features: Sequence[str],
     encoding_profile: str = "BASELINE",
-) -> Tuple[float, float, Optional[float], float, Optional[float]]:
+) -> Tuple[float, float, Optional[float], float, Optional[float], float, float, int]:
+    # CV validation folds are ALWAYS drawn from the same clean_target cohort.
+    # EXPERIMENT filters each fold's TRAIN partition; it never filters VALIDATION.
     # Return fold-mean RMSE/MAE as before plus out-of-fold diagnostics.
     # HIGH_PRICE_MIN_THB and __OTHER__ are diagnostics, not candidate ranking rules.
     y_all = df[TARGET_COLUMN].astype(float)
@@ -783,12 +1058,16 @@ def evaluate_candidate_cv(
     n_validated = 0
     other_model_count = 0
     n_model_mapped = 0
+    eligible_sum_abs = 0.0
+    eligible_sum_sq = 0.0
+    eligible_count = 0
 
     for train_idx, valid_idx in kfold.split(df):
-        train_df = df.iloc[train_idx]
-        valid_df = df.iloc[valid_idx]
+        original_train_df = df.iloc[train_idx]
+        train_df, _ = select_train_rows(original_train_df)
+        valid_df = df.iloc[valid_idx]  # Never filter validation rows.
 
-        y_train = y_all.iloc[train_idx]
+        y_train = train_df[TARGET_COLUMN].astype(float)
         y_valid = y_all.iloc[valid_idx]
 
         state = fit_preprocessor(train_df, initial_source_features, encoding_profile)
@@ -824,6 +1103,14 @@ def evaluate_candidate_cv(
         maes.append(float(mae))
 
         y_np = y_valid.to_numpy(dtype=float)
+        # Report metrics for the same eligible-price cohort in BOTH modes,
+        # in addition to unchanged full-validation metrics used for ranking.
+        eligible = price_filter_eligible_validation_mask(valid_df).to_numpy(dtype=bool)
+        if eligible.any():
+            errors = y_np[eligible] - pred[eligible]
+            eligible_sum_abs += float(np.abs(errors).sum())
+            eligible_sum_sq += float(np.square(errors).sum())
+            eligible_count += int(eligible.sum())
         tail = y_np >= HIGH_PRICE_MIN_THB
         if tail.any():
             tail_absolute_errors.append(np.abs(y_np[tail] - pred[tail]))
@@ -842,8 +1129,13 @@ def evaluate_candidate_cv(
     high_price_mae = (float(np.concatenate(tail_absolute_errors).mean())
                       if tail_absolute_errors else None)
     other_rate = other_model_count / n_model_mapped if n_model_mapped else None
+    eligible_rmse = (math.sqrt(eligible_sum_sq / eligible_count)
+                     if eligible_count else float("nan"))
+    eligible_mae = (eligible_sum_abs / eligible_count
+                    if eligible_count else float("nan"))
     return (float(np.mean(rmses)), float(np.mean(maes)), high_price_mae,
-            negative_predictions / n_validated, other_rate)
+            negative_predictions / n_validated, other_rate,
+            eligible_rmse, eligible_mae, eligible_count)
 
 
 def fit_final_candidate(
@@ -856,6 +1148,9 @@ def fit_final_candidate(
     cv_high_price_mae: Optional[float] = None,
     cv_negative_rate: Optional[float] = None,
     cv_model_other_rate: Optional[float] = None,
+    cv_eligible_rmse: Optional[float] = None,
+    cv_eligible_mae: Optional[float] = None,
+    cv_eligible_count: int = 0,
 ) -> FinalCandidate:
     state = fit_preprocessor(df, initial_source_features, encoding_profile)
 
@@ -903,6 +1198,9 @@ def fit_final_candidate(
         cv_high_price_mae=cv_high_price_mae,
         cv_negative_rate=cv_negative_rate,
         cv_model_other_rate=cv_model_other_rate,
+        cv_eligible_rmse=cv_eligible_rmse,
+        cv_eligible_mae=cv_eligible_mae,
+        cv_eligible_count=cv_eligible_count,
     )
 
 
@@ -1190,6 +1488,12 @@ def build_top1_model_bundle(
     bundle = {
         "artifact_version": "1.0",
         "encoding_profile": top_candidate.encoding_profile,
+        "price_filter_mode": PRICE_FILTER_MODE,
+        "price_filter_max_thb": PRICE_FILTER_MAX_THB,
+        "confirmed_bad_listing_ids": list(CONFIRMED_BAD_LISTING_IDS),
+        "cv_eligible_rmse": top_candidate.cv_eligible_rmse,
+        "cv_eligible_mae": top_candidate.cv_eligible_mae,
+        "cv_eligible_count": top_candidate.cv_eligible_count,
         "encoding_config": ENCODING_PROFILES[top_candidate.encoding_profile],
         "run_id": run_id,
         "model_id": model_id,
@@ -1222,6 +1526,8 @@ def build_top1_model_bundle(
 
 
 def main() -> None:
+    if PRICE_FILTER_MODE not in {"BASELINE", "EXPERIMENT"}:
+        raise ValueError("PRICE_FILTER_MODE must be BASELINE or EXPERIMENT.")
     if not 0.0 < CONFIDENCE_LEVEL < 1.0:
         raise ValueError("CONFIDENCE_LEVEL must be between 0 and 1 (exclusive).")
 
@@ -1243,6 +1549,9 @@ def main() -> None:
     print(f"[CONFIG] P-value    : <= {P_VALUE_THRESHOLD}")
     print(f"[CONFIG] Confidence : {CONFIDENCE_LEVEL:.0%}")
     print(f"[CONFIG] CV folds   : {CV_FOLDS}")
+    print(f"[CONFIG] Price mode : {PRICE_FILTER_MODE}")
+    print(f"[CONFIG] Exclude <= : {PRICE_FILTER_MAX_THB:,.0f} THB (EXPERIMENT train only)")
+    print(f"[CONFIG] Confirmed bad IDs: {len(CONFIRMED_BAD_LISTING_IDS):,}")
     print(f"[CONFIG] Output base: {OUTPUT_DIR.resolve()}")
 
     engine = build_engine()
@@ -1263,10 +1572,25 @@ def main() -> None:
         f"[INFO] Snapshot PCS_DATE = {pcs_date.date().isoformat()}"
     )
 
+    # Price-quality screening is always informational: no suspected peer
+    # outliers are removed just because they have a review flag.
+    export_outlier_flag_only_reports(df, pcs_date, run_id)
+
     df = clean_target(df)
     df = maybe_convert_numeric_like_columns(df)
 
-    eligible_features, excluded_info = infer_eligible_features(df)
+    # Fixed CV splits are built from this FULL cleaned cohort in both modes.
+    # The experimental filter applies inside each CV train fold and final fit.
+    final_train_df, exclusion_reasons = select_train_rows(df)
+    export_train_row_selection_report(df, exclusion_reasons, pcs_date, run_id)
+    print(f"[PRICE FILTER] Full positive-price cohort: {len(df):,} rows")
+    print(f"[PRICE FILTER] Final-fit training rows : {len(final_train_df):,} rows")
+    print(f"[PRICE FILTER] Train-only excluded     : {len(df) - len(final_train_df):,} rows")
+    if PRICE_FILTER_MODE == "EXPERIMENT":
+        print("[PRICE FILTER] Validation retains ALL positive-price rows, including <=1,000 THB.")
+    print("[PRICE FILTER] Peer-group SUSPECTED_OUTLIER flags are review-only.")
+
+    eligible_features, excluded_info = infer_eligible_features(final_train_df)
 
     print(
         f"[INFO] Eligible predictors ({len(eligible_features)}): "
@@ -1309,12 +1633,13 @@ def main() -> None:
         )
 
         try:
-            cv_rmse, cv_mae, tail_mae, negative_rate, model_other_rate = evaluate_candidate_cv(
+            (cv_rmse, cv_mae, tail_mae, negative_rate, model_other_rate,
+             eligible_rmse, eligible_mae, eligible_count) = evaluate_candidate_cv(
                 df, feature_set, profile,
             )
 
             final_candidate = fit_final_candidate(
-                df=df,
+                df=final_train_df,
                 candidate_id=candidate_id,
                 initial_source_features=feature_set,
                 cv_rmse=cv_rmse,
@@ -1323,6 +1648,9 @@ def main() -> None:
                 cv_high_price_mae=tail_mae,
                 cv_negative_rate=negative_rate,
                 cv_model_other_rate=model_other_rate,
+                cv_eligible_rmse=eligible_rmse,
+                cv_eligible_mae=eligible_mae,
+                cv_eligible_count=eligible_count,
             )
 
             fitted_candidates.append(final_candidate)
@@ -1336,6 +1664,11 @@ def main() -> None:
                 f"{len(final_candidate.selected_source_features)} | "
                 f"VehicleFeatures="
                 f"{[c for c in final_candidate.selected_source_features if c.lower() in CORE_VEHICLE_FEATURES + OPTIONAL_VEHICLE_FEATURES]}"
+            )
+            print(
+                f"        OOF eligible cohort (price > {PRICE_FILTER_MAX_THB:,.0f} THB): "
+                f"RMSE={eligible_rmse:,.2f} | MAE={eligible_mae:,.2f} "
+                f"| n={eligible_count:,} (not used for rank)"
             )
             print(
                 f"        OOF MAE(>= {HIGH_PRICE_MIN_THB:,.0f}THB)="
@@ -1387,7 +1720,7 @@ def main() -> None:
         top_candidates=top_candidates,
         run_datetime=run_datetime,
         pcs_date=pcs_date,
-        n_observation=len(df),
+        n_observation=len(final_train_df),
     )
 
     coefficient_df = build_coefficient_dataframe(
@@ -1454,6 +1787,12 @@ def main() -> None:
         print(
             "         Features: "
             + ", ".join(candidate.selected_source_features)
+        )
+        print(
+            f"         Shared eligible validation cohort: "
+            f"RMSE={candidate.cv_eligible_rmse:,.2f} | "
+            f"MAE={candidate.cv_eligible_mae:,.2f} | "
+            f"n={candidate.cv_eligible_count:,}"
         )
 
     print()
