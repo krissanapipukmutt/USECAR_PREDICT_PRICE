@@ -368,3 +368,92 @@ Implementation และ synthetic validationเสร็จ แต่สถา�
 - เจ้าของต้องอนุญาต read-only schema reviewก่อน จากนั้นตรวจ inventory, leakage/predict availabilityและ datatype แล้วระบุ featureที่จะ APPROVE
 - หลัง registryได้รับอนุมัติ ต้อง rerun testsและขออนุมัติ Controlled V4 Training แยกต่างหาก
 - ห้าม Commit/Pushจนได้รับอนุมัติ
+
+## 2026-09-20 — Actual SQL Schema Review Attempt
+
+### ขอบเขตและสถานะ Git
+
+- ได้รับอนุญาตเฉพาะ read-only column metadata ของ `USED_CAR_DB.dbo.STG_USED_CAR` ผ่าน `INFORMATION_SCHEMA.COLUMNS`, `sys.columns` หรือ `SELECT TOP (0)`; ห้ามอ่านข้อมูลรถ, Training, DDL/DML, Commit และ Push
+- ก่อนตรวจ: branch `master`, commit `d5e89ad65a5f17bc94d5a457830b99bdd5fd3a2a`, working treeสะอาดและ tracking `origin/master`
+- ตรวจเฉพาะ Registry, Initial Feature Inventory และ Approval Gateที่เกี่ยวข้อง ไม่ได้สำรวจ Projectใหม่
+
+### ผลการเชื่อมต่อ
+
+- **BLOCKED:** processของงานนี้ไม่พบ environment keys `USED_CAR_DB_SERVER`, `USED_CAR_DB_PORT`, `USED_CAR_DB_DATABASE`, `USED_CAR_DB_USER`, `USED_CAR_DB_PASSWORD`, `USED_CAR_DB_DRIVER`, `USED_CAR_DB_SCHEMA` และ `USED_CAR_SOURCE_TABLE` ทั้งใน shell environmentและ macOS launch environment
+- Metadata scriptหยุดก่อนสร้าง engine/เปิด connection เพราะไม่มี `USED_CAR_DB_PASSWORD`; ไม่มี SQL statementถูกส่งไป SQL Server
+- Errorถูกรายงานเฉพาะประเภท `RuntimeError` และสถานะ failure ไม่มี password, credentialed connection stringหรือค่าลับถูกแสดง/บันทึก
+
+### สิ่งที่ยังไม่ยืนยัน
+
+- **NOT TESTED:** actual column names, SQL data types, nullability, ordinal positions, New/Missing/Type-changed status และ schema fingerprintของ `dbo.STG_USED_CAR`
+- ไม่ใช้ historical CSV headerแทน actual schema และไม่ได้สร้าง Schema Review Report
+- Registry `2026-09-20-draft-1` ยังไม่ถูกแก้; ทุก feature statusและ `initial_approval_status=PENDING_OWNER_APPROVAL` คงเดิม
+- ไม่แก้ Application Code, Registry, Data Dictionaryหรือ Database และไม่รัน Training/Commit/Push
+
+### เงื่อนไขสำหรับลองใหม่
+
+- ต้องให้ environment variablesถูก exportและมองเห็นได้จาก processที่รัน Codex/terminalนี้ โดยไม่ส่งค่าลับผ่านบทสนทนา
+- เมื่อ environmentพร้อม ให้รันเฉพาะ parameterized queryต่อ `INFORMATION_SCHEMA.COLUMNS` และบันทึกเฉพาะ column metadata/registry comparison จากนั้นหยุดรอ owner approvalราย feature
+
+## 2026-09-20 — Local Metadata-only Schema Review Runner
+
+### การเปลี่ยนแปลง
+
+- เพิ่ม `scripts/review_stg_schema.py` เป็น standalone metadata reader ใช้ parameterized `SELECT` เฉพาะ `ORDINAL_POSITION`, `COLUMN_NAME`, `DATA_TYPE`, `IS_NULLABLE` จาก `INFORMATION_SCHEMA.COLUMNS`
+- Scriptตรวจว่า SQLขึ้นต้นด้วย `SELECT`, อ้างเฉพาะ `INFORMATION_SCHEMA.COLUMNS` และไม่มี DDL/DML/EXEC/permission tokensก่อนสร้าง connection
+- เพิ่ม `scripts/run_schema_review.sh` เพื่อถาม `USED_CAR_DB_PASSWORD` ด้วย hidden prompt (`read -s`) ภายใน child process; ปิด shell tracingและไม่ใส่ passwordใน command lineหรือ shell history
+- Connection/driver errorถูก sanitizeให้เหลือ exception type ไม่พิมพ์ driver message, passwordหรือ credentialed connection string
+- Default reportอยู่ใต้ ignored local path `output/analysis/schema_review/actual_schema_<timestamp>.json`; refuse overwriteและเก็บเฉพาะ schema/table name, generated time, fingerprint, column countและ column metadata ไม่มีข้อมูลรถ
+- ไม่แก้ Application Code, Registry, Data Dictionaryหรือ Database และไม่ได้รัน scriptกับ SQL Serverในรอบนี้
+
+### Verification
+
+- PASSED: Python AST parseและ `--help`; metadata SQL static assertionยอมรับ queryที่กำหนดและปฏิเสธ non-SELECT/DDL-DML examples
+- PASSED: `bash -n scripts/run_schema_review.sh`, executable permissions, `git diff --check` และตรวจว่า output pathถูก `.gitignore`
+- NOT TESTED: SQL Server connectionและ reportจริง ต้องให้เจ้าของรันจาก VS Code Terminalแล้วแจ้ง path/result
+
+### คำสั่งสำหรับเจ้าของ Project
+
+จาก Project root รัน:
+
+```bash
+./scripts/run_schema_review.sh
+```
+
+กรอก passwordที่ hidden prompt Passwordอยู่ใน environmentของ child processเท่านั้นและไม่ถูกบันทึกใน command history หาก non-secret connection settingsต่างจาก defaults ให้ exportเฉพาะ keysเหล่านั้นก่อน เช่น `USED_CAR_DB_SERVER`, `USED_CAR_DB_PORT`, `USED_CAR_DB_DATABASE`, `USED_CAR_DB_USER`, `USED_CAR_DB_DRIVER`, `USED_CAR_DB_SCHEMA`, `USED_CAR_SOURCE_TABLE`
+
+หลังรัน ห้าม Commit/Push report ให้แจ้งเฉพาะ pathและสถานะสำเร็จ แล้วจึงทำ Registry comparisonในรอบถัดไป โดยยังไม่เปลี่ยน `PENDING_REVIEW`/`initial_approval_status`จนกว่าเจ้าของอนุมัติราย feature
+
+## 2026-09-20 — Initial Owner Approval และ Offline Schema Gate Validation
+
+### หลักฐานและ Registry
+
+- ยืนยัน local report `output/analysis/schema_review/actual_schema_20260920_130140.json`: type `SQL_SERVER_COLUMN_METADATA_ONLY`, scope `dbo.STG_USED_CAR`, declared/actual count 27 และ fingerprintคำนวณซ้ำตรง `ef6ea4a011dac3266e727440d547efa018aa9a787a491a755077f467aec53a5c`
+- ไม่มีการเชื่อม SQL Serverเพิ่มและไม่ใช้ข้อมูลรถ รายงานมีเฉพาะ ordinal/name/type/nullability
+- ตาม Owner Approval เปลี่ยนเฉพาะ `brand`, `model`, `sub_model`, `model_year`, `mileage`, `fuel_type`, `transmission`, `engine_size`, `body_type`, `color`, `number_of_seats` เป็น APPROVED
+- คง `province`, `location`, `seller_name`, `seller_type` เป็น PENDING_REVIEW และคง TARGET/MANDATORY_METADATA/EXCLUDEDเดิม
+- Registry versionใหม่ `2026-09-20-initial-owner-approved-1`, `initial_approval_status=APPROVED`; checksum SHA-256 `534a102146262896f9e3b34781f9d12aba02e398acd27fd8a2d0752a12dd1cd6`
+- Approval scopeคือ Candidate Universe entryเท่านั้น ไม่ได้รันหรืออนุมัติ Controlled/Full Training
+
+### Metadata-only Validation
+
+- เพิ่ม `scripts/validate_schema_registry.py` อ่านเฉพาะ local JSON reportและ Registry ไม่ import/call Training `main()` และไม่เชื่อม Database
+- ตรวจ report type/scope/count/fingerprint/ordinals, mandatory columns, New/Missing columns, SQL-type family compatibility และ predictor authorizationต่อ status
+- Actual validation **PASSED**: 11 Approvedอยู่ครบและ compatible (`nvarchar→text`; `smallint/bigint/int/decimal→numeric`), 4 Pendingไม่ authorized, Target/Metadata/Excludedไม่ authorized, New=0, Missing=0, issues=0
+- `PCS_DATE` เป็น SQL `date→datetime`; Pandasอาจ materializeเป็น datetime64หรือ Python date object (`text` classification) และ Registryรองรับทั้งสองแบบ Testsยืนยันแล้ว ไม่ต้องแก้ Application Code
+
+### Tests และขอบเขต
+
+- PASSED: synthetic unittest suite 36/36 รวม owner-approved 11/Pending 4, SQL-to-Pandas date compatibility, offline validator success/failure, pending exclusionจาก preprocessing และ V4 contractsเดิม
+- PASSED: offline validation commandกับ Actual Schema Report, Python AST/JSON, shell syntax, `git diff --check` และ secret scan
+- NOT TESTED: Runtime Training Gateบน DataFrameจริง, row data, Controlled/Full Training, model metrics/artifacts และ UI runtime
+- ไม่แก้ Database/STG/Data Dictionary/Predict Logic/UI และไม่ Commit/Push
+
+### คำสั่ง Validation
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python scripts/validate_schema_registry.py \
+  output/analysis/schema_review/actual_schema_20260920_130140.json
+```
+
+สถานะ: Registry+metadata validationเสร็จ รอ ownerอนุมัติ Controlled V4 Trainingแยกต่างหาก

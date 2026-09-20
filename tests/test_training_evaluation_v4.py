@@ -7,11 +7,12 @@ deserialization.  The module is compatible with both ``unittest`` and pytest.
 from __future__ import annotations
 
 import copy
+import importlib.util
 import json
 import os
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -20,6 +21,13 @@ import pandas as pd
 
 import train_used_car_ols as training
 from predict_used_car_ols import make_state, predict
+
+
+_validator_path = Path(__file__).resolve().parents[1] / "scripts" / "validate_schema_registry.py"
+_validator_spec = importlib.util.spec_from_file_location("schema_registry_validator", _validator_path)
+schema_registry_validator = importlib.util.module_from_spec(_validator_spec)
+assert _validator_spec.loader is not None
+_validator_spec.loader.exec_module(schema_registry_validator)
 
 
 def synthetic_cars(n: int = 60) -> pd.DataFrame:
@@ -247,15 +255,48 @@ class FeatureApprovalGateTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "not owner-approved"):
             training.assert_feature_registry_approved(gate)
 
-    def test_project_registry_is_a_non_approved_initial_proposal(self) -> None:
+    def test_project_registry_matches_initial_owner_approval(self) -> None:
         registry, checksum = training.load_feature_registry()
+        approved_expected = {
+            "brand", "model", "sub_model", "model_year", "mileage",
+            "fuel_type", "transmission", "engine_size", "body_type",
+            "color", "number_of_seats",
+        }
+        pending_expected = {"province", "location", "seller_name", "seller_type"}
+        values = {}
+        for entry in registry["columns"]:
+            name = entry["name"]
+            allowed = entry["allowed_schema_types"]
+            if name == "PCS_DATE":
+                values[name] = pd.to_datetime(["2026-09-20"] * 5)
+            elif "numeric" in allowed:
+                values[name] = np.arange(5, dtype=float) + 1
+            elif "datetime" in allowed:
+                values[name] = pd.to_datetime(["2026-09-20"] * 5)
+            else:
+                values[name] = [f"value-{i}" for i in range(5)]
+        frame = pd.DataFrame(values)
         gate = training.evaluate_feature_approval_gate(
-            self.frame(), registry, checksum
+            frame, registry, checksum
         )
-        self.assertEqual(gate.initial_approval_status, "PENDING_OWNER_APPROVAL")
-        self.assertEqual(gate.approved_features, [])
-        with self.assertRaisesRegex(RuntimeError, "not owner-approved"):
-            training.assert_feature_registry_approved(gate)
+        self.assertEqual(gate.initial_approval_status, "APPROVED")
+        self.assertEqual(set(gate.approved_features), approved_expected)
+        training.assert_feature_registry_approved(gate)
+        statuses = {x["name"]: x["status"] for x in registry["columns"]}
+        self.assertTrue(all(statuses[x] == "PENDING_REVIEW" for x in pending_expected))
+        self.assertEqual(
+            {x for x, status in statuses.items() if status == "APPROVED"},
+            approved_expected,
+        )
+
+    def test_sql_date_and_pandas_date_object_are_compatible_metadata_types(self) -> None:
+        registry, _ = training.load_feature_registry()
+        pcs_entry = next(x for x in registry["columns"] if x["name"] == "PCS_DATE")
+        self.assertEqual(schema_registry_validator.sql_schema_type("date"), "datetime")
+        pandas_type = training.schema_type_of(pd.Series([date(2026, 9, 20)]))
+        self.assertEqual(pandas_type, "text")
+        self.assertIn("datetime", pcs_entry["allowed_schema_types"])
+        self.assertIn("text", pcs_entry["allowed_schema_types"])
 
     def test_pending_feature_never_reaches_preprocessing(self) -> None:
         frame = self.frame()
@@ -281,6 +322,88 @@ class FeatureApprovalGateTests(unittest.TestCase):
         self.assertIn("schema_fingerprint", payload)
         self.assertEqual(len(payload["columns"]), len(gate.records))
         self.assertNotIn(str(self.frame()["price"].iloc[-1]), text)
+
+
+class MetadataSchemaValidationTests(unittest.TestCase):
+    def test_offline_validator_accepts_approved_pending_and_excluded_contract(self) -> None:
+        columns = [
+            {"ordinal_position": 1, "column_name": "PCS_DATE",
+             "sql_data_type": "date", "nullable": "NO"},
+            {"ordinal_position": 2, "column_name": "price",
+             "sql_data_type": "bigint", "nullable": "YES"},
+            {"ordinal_position": 3, "column_name": "brand",
+             "sql_data_type": "nvarchar", "nullable": "YES"},
+            {"ordinal_position": 4, "column_name": "province",
+             "sql_data_type": "nvarchar", "nullable": "YES"},
+            {"ordinal_position": 5, "column_name": "raw_price",
+             "sql_data_type": "nvarchar", "nullable": "YES"},
+        ]
+        report = {
+            "report_type": "SQL_SERVER_COLUMN_METADATA_ONLY",
+            "schema_name": "dbo", "table_name": "STG_USED_CAR",
+            "column_count": len(columns), "columns": columns,
+            "schema_fingerprint_sha256":
+                schema_registry_validator.canonical_fingerprint(columns),
+        }
+        registry = {
+            "registry_version": "approved-test", "initial_approval_status": "APPROVED",
+            "columns": [
+                {"name": "PCS_DATE", "status": "MANDATORY_METADATA",
+                 "allowed_schema_types": ["datetime", "text"]},
+                {"name": "price", "status": "TARGET",
+                 "allowed_schema_types": ["numeric", "text"]},
+                {"name": "brand", "status": "APPROVED",
+                 "allowed_schema_types": ["text"]},
+                {"name": "province", "status": "PENDING_REVIEW",
+                 "allowed_schema_types": ["text"]},
+                {"name": "raw_price", "status": "EXCLUDED",
+                 "allowed_schema_types": ["numeric", "text"]},
+            ],
+        }
+        result = schema_registry_validator.validate(report, registry, "checksum")
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["approved_compatible_features"], ["brand"])
+        authorized = {x["column_name"]: x["predictor_authorized"]
+                      for x in result["comparisons"]}
+        self.assertTrue(authorized["brand"])
+        self.assertFalse(authorized["province"])
+        self.assertFalse(authorized["price"])
+        self.assertFalse(authorized["PCS_DATE"])
+        self.assertFalse(authorized["raw_price"])
+
+    def test_offline_validator_blocks_missing_or_incompatible_approved_feature(self) -> None:
+        columns = [
+            {"ordinal_position": 1, "column_name": "PCS_DATE",
+             "sql_data_type": "date", "nullable": "NO"},
+            {"ordinal_position": 2, "column_name": "price",
+             "sql_data_type": "bigint", "nullable": "YES"},
+            {"ordinal_position": 3, "column_name": "brand",
+             "sql_data_type": "bigint", "nullable": "YES"},
+        ]
+        report = {
+            "report_type": "SQL_SERVER_COLUMN_METADATA_ONLY",
+            "schema_name": "dbo", "table_name": "STG_USED_CAR",
+            "column_count": 3, "columns": columns,
+            "schema_fingerprint_sha256":
+                schema_registry_validator.canonical_fingerprint(columns),
+        }
+        registry = {
+            "registry_version": "approved-test", "initial_approval_status": "APPROVED",
+            "columns": [
+                {"name": "PCS_DATE", "status": "MANDATORY_METADATA",
+                 "allowed_schema_types": ["datetime"]},
+                {"name": "price", "status": "TARGET",
+                 "allowed_schema_types": ["numeric"]},
+                {"name": "brand", "status": "APPROVED",
+                 "allowed_schema_types": ["text"]},
+                {"name": "model", "status": "APPROVED",
+                 "allowed_schema_types": ["text"]},
+            ],
+        }
+        result = schema_registry_validator.validate(report, registry, "checksum")
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["missing_columns"], ["model"])
+        self.assertEqual(result["approved_compatible_features"], [])
 
 
 class SplitAndFoldTests(unittest.TestCase):

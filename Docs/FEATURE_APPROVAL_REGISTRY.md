@@ -1,30 +1,55 @@
-# Feature Approval Registry — Initial Proposal
+# Feature Approval Registry — Initial Owner Approval
 
-ไฟล์ที่ระบบใช้จริงคือ `config/feature_approval_registry.json` รุ่น `2026-09-20-draft-1` และมีสถานะ `PENDING_OWNER_APPROVAL` เอกสารนี้เป็น inventory สำหรับตรวจรับรองครั้งแรก ไม่ใช่หลักฐานว่าได้ตรวจ schema ปัจจุบันจาก SQL Server และยังไม่อนุญาตให้ Full Training
+Registry ที่ระบบใช้จริงคือ `config/feature_approval_registry.json` รุ่น `2026-09-20-initial-owner-approved-1` สถานะ `APPROVED` การอนุมัตินี้ให้สิทธิเฉพาะการเข้าสู่ Candidate Universe แต่ละ feature ยังต้องผ่าน fold-local eligibility, preprocessing และ feature selection ตาม V4 และยังไม่มีการอนุมัติให้รัน Controlled/Full Training
 
-## หลักฐานและขอบเขต
+## หลักฐาน Actual Schema
 
-รายการเริ่มต้นมาจาก exclusion rules ใน source code, input controls ของ UI, historical selected-feature metadata และ header ของ local raw CSV เท่านั้น รอบนี้ไม่ได้เชื่อม SQL Server จึงยังไม่ทราบว่าคอลัมน์ใดเพิ่ม หาย หรือเปลี่ยน datatype ใน `dbo.STG_USED_CAR` ปัจจุบัน
+- Local metadata-only report: `output/analysis/schema_review/actual_schema_20260920_130140.json`
+- Source: `dbo.STG_USED_CAR`
+- ตรวจเมื่อ: 2026-09-20 13:01:40 +07:00
+- Columns: 27
+- Schema fingerprint: `ef6ea4a011dac3266e727440d547efa018aa9a787a491a755077f467aec53a5c`
+- Report fingerprint ถูกคำนวณซ้ำจาก column metadataแล้วตรงกัน ไม่มีข้อมูลรถรายแถว
 
-| สถานะเสนอ | คอลัมน์ | เหตุผลย่อ |
-| --- | --- | --- |
-| TARGET | `price` | Target ที่ทราบเฉพาะ Train/Evaluation ห้ามใช้เป็น predictor |
-| MANDATORY_METADATA | `PCS_DATE` | ระบุ latest snapshot ห้ามใช้เป็น predictor |
-| PENDING_REVIEW — มี input path ปัจจุบัน | `brand`, `model`, `sub_model`, `model_year`, `mileage`, `fuel_type`, `transmission`, `engine_size`, `body_type`, `color`, `number_of_seats` | เคยเป็น candidate/feature หรือมี CLI/UI input แต่ยังไม่ได้รับ business approval ครั้งแรก |
-| PENDING_REVIEW — input contract ยังไม่ชัด | `province`, `location`, `seller_name`, `seller_type` | ต้องยืนยันความหมาย, cardinality และความพร้อมตอน Predict ก่อนอนุมัติ |
-| EXCLUDED | `listing_id`, `source_url` | Technical identity ใช้ duplicate grouping/audit เท่านั้น |
-| EXCLUDED — leakage risk | `title`, `raw_price`, `description` | อาจมี target price หรือข้อมูลที่ไม่เหมาะกับ prediction-time contract |
-| EXCLUDED — raw/technical metadata | `raw_mileage`, `seller_url`, `image_url`, `scraped_at`, `dealer_slug` | Raw duplicate, URL หรือ collection/technical metadata ตาม exclusion policy เดิม |
+รายงานนี้ยืนยันโครงสร้าง ณ เวลาที่ตรวจเท่านั้น Schema Gate ต้องตรวจใหม่ทุก run
 
-คอลัมน์จริงที่ไม่อยู่ใน registry จะปรากฏใน Schema Review Report เป็น `PENDING_REVIEW` เสมอ แม้ข้อมูลสมบูรณ์หรือสัมพันธ์กับ target สูง ระบบไม่เขียนชื่อใหม่กลับเข้า registry และไม่ส่งเข้า preprocessing, feature selection, CV หรือ refit
+## สถานะที่เจ้าของอนุมัติ
 
-## ขั้นตอนตรวจรับรองของเจ้าของ Project
+| สถานะ | คอลัมน์ | SQL type จริง | Prediction-time evidence / เหตุผล |
+| --- | --- | --- | --- |
+| TARGET | `price` | `bigint` | Target เท่านั้น ไม่ใช่ predictor |
+| MANDATORY_METADATA | `PCS_DATE` | `date` | Snapshot metadata ไม่ใช่ predictor |
+| APPROVED | `brand`, `model`, `sub_model` | `nvarchar` | มี CLI/UI input; ยังต้องผ่าน fold-local eligibility |
+| APPROVED | `model_year` | `smallint` | มี CLI/UI input; numeric compatible |
+| APPROVED | `mileage` | `bigint` | มี CLI/UI input; numeric compatible |
+| APPROVED | `fuel_type`, `transmission` | `nvarchar` | มี CLI/UI input; categorical compatible |
+| APPROVED | `engine_size` | `decimal` | มี CLI/UI input; numeric compatible |
+| APPROVED | `body_type`, `color` | `nvarchar` | มี CLI/UI input; categorical compatible |
+| APPROVED | `number_of_seats` | `int` | มี CLI/UI input; numeric compatible |
+| PENDING_REVIEW | `province`, `location`, `seller_name`, `seller_type` | `nvarchar` | Input contract/business meaningยังไม่อนุมัติ จึงห้ามเข้า Candidate Universe |
+| EXCLUDED — identity | `listing_id`, `source_url` | `bigint`, `nvarchar` | ใช้ duplicate grouping/audit ไม่ใช่ predictor |
+| EXCLUDED — leakage risk | `title`, `raw_price`, `description` | `nvarchar` | อาจมี target priceหรือข้อมูลที่ไม่เหมาะกับ prediction contract |
+| EXCLUDED — raw/technical | `raw_mileage`, `dealer_slug`, `seller_url`, `image_url`, `scraped_at` | `nvarchar`, `datetime2` | Raw duplicate, URL หรือ collection/technical metadata |
 
-1. อนุญาต read-only schema review กับ SQL Server เพื่อสร้าง `schema_review_<RUN_ID>.json`; รอบนี้ยังไม่ได้ทำ
-2. ตรวจ New/Missing/Type-changed columns, leakage risk และ prediction-time availability จากรายงาน โดยไม่ตรวจจากข้อมูลรถรายแถว
-3. เปลี่ยนเฉพาะ feature ที่ยืนยันแล้วจาก `PENDING_REVIEW` เป็น `APPROVED`; คง target/metadata/exclusions และเหตุผลไว้
-4. ตรวจ `allowed_schema_types` โดยเฉพาะ numeric feature ที่อนุญาต text ได้เฉพาะ numeric-like conversion ซึ่งจะเรียนและตรวจใน fold train
-5. เปลี่ยน `initial_approval_status` เป็น `APPROVED` ผ่านการแก้ไฟล์ที่ review ย้อนหลังได้ แล้วรัน tests ใหม่
-6. จึงพิจารณาอนุมัติ Controlled V4 Training แยกต่างหาก ระบบจะบันทึก registry version/checksum, schema fingerprint และ approved features ลง evaluation metadata และ model bundle
+ไม่มีคอลัมน์ New/Missing เมื่อเทียบ Actual Schema กับ Registry ฉบับนี้
 
-การอนุมัติใน registry เป็นเพียงสิทธิให้ feature เข้าสู่ candidate universe Feature ยังต้องผ่าน fold-local eligibility และอาจไม่ถูกเลือกเข้าโมเดล
+## Type Compatibility
+
+- SQL `nvarchar` → registry type `text`
+- SQL `smallint`, `bigint`, `int`, `decimal` → registry type `numeric`
+- SQL `date`/`datetime2` → SQL metadata type `datetime`
+- `PCS_DATE` จาก SQL `date` อาจถูก Pandas materializeเป็น `datetime64` หรือ Python `date` ใน object series Runtime gateจึงรองรับ registry typesทั้ง `datetime` และ `text`; regression testยืนยันสองเส้นทางนี้
+- Numeric feature ที่ภายหลังเปลี่ยนเป็น textยังต้องผ่าน numeric-like inferenceจาก fold train ห้ามถือว่า type allowanceบังคับให้ featureผ่าน eligibility
+
+## Offline Validation
+
+คำสั่งที่ใช้โดยไม่เชื่อม SQL Serverและไม่เรียก Training `main()`:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python scripts/validate_schema_registry.py \
+  output/analysis/schema_review/actual_schema_20260920_130140.json
+```
+
+ผล: valid, fingerprintตรง, mandatoryครบ, 11 Approved compatible, 4 Pendingไม่ authorized, Target/Metadata/Excludedไม่ authorized และไม่มี New/Missing columns
+
+หาก Approved featureหายหรือชนิดไม่รองรับ validatorและ runtime gateต้องรายงานและไม่อนุญาตให้ใช้ ไม่มีการแก้ Registryหรืออนุมัติ featureอัตโนมัติ
