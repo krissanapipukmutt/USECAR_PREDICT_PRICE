@@ -325,3 +325,46 @@ Scriptใช้ RUN_IDเดียวกับ `logs/train_<RUN_ID>.log` แล�
 ### สถานะการส่งมอบ
 
 Implementation และ synthetic validationเสร็จ แต่สถานะยังเป็น **awaiting owner approval for controlled V4 training run** ห้าม Commit/Pushจนได้รับอนุมัติ
+
+## 2026-09-20 — V4 Dynamic Schema Feature Approval Gate
+
+### Baseline และขอบเขต
+
+- ต่อจาก clean `master` commit `17cb50c829282a9584968b736ef4b6b1a51e310a`; ไม่ย้อน V4 และไม่สร้าง Subagentเพิ่ม
+- ได้รับอนุมัติให้เพิ่ม explicit Feature Approval Gate, initial inventory/registry, schema report, metadata และ synthetic tests
+- ไม่เชื่อม SQL Server, ไม่อ่าน actual current STG schema, ไม่ Full Training, ไม่แก้ DB/Data Dictionary/Predictor/UI และไม่ Commit/Push
+
+### Implementation
+
+- เพิ่ม authoritative registry `config/feature_approval_registry.json` แยก `APPROVED`, `EXCLUDED`, `PENDING_REVIEW`, `MANDATORY_METADATA` และ `TARGET` พร้อม allowed schema types, prediction availability, leakage risk และเหตุผล
+- Initial registry เป็น `2026-09-20-draft-1`, `PENDING_OWNER_APPROVAL`, ไม่มี APPROVED predictor จึง fail fastก่อน price reports, split, preprocessing, CV หรือ OLS; ระบบเขียนได้เฉพาะ aggregate Schema Review Reportก่อนหยุด
+- `load_feature_registry()` ตรวจ JSON, version, status, duplicate names, allowed types และบังคับ `price=TARGET`, `PCS_DATE=MANDATORY_METADATA`; checksumคำนวณจาก file bytesเพื่อ auditการอนุมัติ
+- `evaluate_feature_approval_gate()` ตรวจทุก source columnแบบ case-insensitiveโดยใช้ storage dtypeเท่านั้น ไม่ใช้ distributionหรือ Holdout target; unregistered/renamed columnsเป็น `PENDING_REVIEW`, typeไม่ compatibleถูกหยุดใช้, missing APPROVEDถูกรายงาน และไม่มีการแก้ registryอัตโนมัติ
+- `infer_candidate_universe()` ต้องรับ approved feature namesจาก gateและตัด Pending/Excluded/Target/Metadataก่อน eligibility; fold-local `infer_eligible_features()`/`fit_preprocessor()`/feature selectionยังทำงานชั้นถัดไปตาม V4เดิม
+- เพิ่ม `schema_review_<RUN_ID>.json` ใน `output/analysis/<PCS_DATE>/` พร้อม PCS_DATE, statuses, New/Missing/Type-changed, reasons, registry checksum/versionและ schema fingerprint ไม่มีข้อมูลรถรายแถว
+- Evaluation metadataและ Rank-1 bundleเพิ่ม registry version/checksum, schema fingerprintและ approved featuresของ runแบบ additive ไม่เปลี่ยน RESULT 18 columns, COEFFICIENT 13 columnsหรือ Predictor logic
+- เพิ่ม [FEATURE_APPROVAL_REGISTRY.md](FEATURE_APPROVAL_REGISTRY.md) เป็น Initial Feature Inventory และขั้นตอน owner approval โดยระบุชัดว่าไม่ได้ตรวจ SQL Server schemaรอบนี้
+
+### Initial inventory ที่รออนุมัติ
+
+- TARGET: `price`; MANDATORY_METADATA: `PCS_DATE`
+- PENDING_REVIEW ที่มี CLI/UI path: `brand`, `model`, `sub_model`, `model_year`, `mileage`, `fuel_type`, `transmission`, `engine_size`, `body_type`, `color`, `number_of_seats`
+- PENDING_REVIEW ที่ input contractยังไม่ชัด: `province`, `location`, `seller_name`, `seller_type`
+- EXCLUDED identity: `listing_id`, `source_url`; leakage risk: `title`, `raw_price`, `description`; raw/technical: `raw_mileage`, `seller_url`, `image_url`, `scraped_at`, `dealer_slug`
+- Actual SQL Server New/Missing/Type-changed columns: **NOT TESTED**; ต้องทำ read-only schema reviewหลังได้รับอนุญาต
+
+### Automated tests และผลตรวจ
+
+- PASSED: synthetic unittest suite 33/33 หลังเพิ่ม approval-gate tests
+- ครอบคลุม Approved+eligibleเข้า candidate universe, Pendingที่สัมพันธ์ targetสูงไม่เข้า, Excludedไม่เข้า, new featureไม่แก้ registry, missing/renamed Approved, unsupported datatype, missing mandatory, initial approval block และ Pendingไม่ถึง preprocessing
+- PASSED: bundle compatibilityพร้อม additive feature-approval metadata; RESULT/COEFFICIENT contractsเดิมยังอยู่ใน regression tests
+- PASSED: Python AST parse, registry JSON load/validation, `bash -n scripts/run_training_v4.sh`, `git diff --check` และ changed-file secret-pattern scan
+- NOT TESTED: actual SQL schema/report, DB connectivity, real datatype compatibility, controlled training, real artifacts/logและ Streamlit rendering
+- LIMITATION: Gateตรวจ datatype driftและชื่อคอลัมน์ได้ แต่ semantic driftที่ชื่อและ datatypeเดิมไม่สามารถพิสูจน์อัตโนมัติ ต้องอาศัย owner/data-contract reviewก่อนเปลี่ยน registry version
+
+### สถานะและงานรอเจ้าของ
+
+- **BLOCKED BY POLICY:** Controlled/Full Training จนกว่า actual schemaถูก reviewและเจ้าของเปลี่ยน registry statusesอย่างตรวจย้อนหลังได้ รวมทั้ง `initial_approval_status=APPROVED`
+- เจ้าของต้องอนุญาต read-only schema reviewก่อน จากนั้นตรวจ inventory, leakage/predict availabilityและ datatype แล้วระบุ featureที่จะ APPROVE
+- หลัง registryได้รับอนุมัติ ต้อง rerun testsและขออนุมัติ Controlled V4 Training แยกต่างหาก
+- ห้าม Commit/Pushจนได้รับอนุมัติ

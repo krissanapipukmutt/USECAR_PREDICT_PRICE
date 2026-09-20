@@ -52,6 +52,9 @@ OUTPUT_DIR = Path(
         "/Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE/output/train",
     )
 )
+FEATURE_REGISTRY_PATH = (
+    Path(__file__).resolve().parent / "config" / "feature_approval_registry.json"
+)
 
 # =============================================================================
 # 2) MODEL CONFIG
@@ -236,6 +239,18 @@ class CandidateExperiment:
     encoding_profile: str
 
 
+@dataclass(frozen=True)
+class SchemaGateResult:
+    registry_version: str
+    registry_checksum: str
+    schema_fingerprint: str
+    initial_approval_status: str
+    approved_features: List[str]
+    missing_approved_features: List[str]
+    incompatible_approved_features: List[str]
+    records: List[dict]
+
+
 @dataclass
 class FinalCandidate:
     candidate_id: int
@@ -364,6 +379,206 @@ def normalize_required_column_names(df: pd.DataFrame) -> pd.DataFrame:
         rename_map[pcs_actual] = PCS_DATE_COLUMN
 
     return df.rename(columns=rename_map)
+
+
+FEATURE_REGISTRY_STATUSES = {
+    "APPROVED", "EXCLUDED", "PENDING_REVIEW",
+    "MANDATORY_METADATA", "TARGET",
+}
+
+
+def load_feature_registry(path: Path = FEATURE_REGISTRY_PATH) -> Tuple[dict, str]:
+    if not path.is_file():
+        raise RuntimeError(f"Feature approval registry was not found: {path}")
+    raw = path.read_bytes()
+    try:
+        registry = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Feature approval registry is invalid JSON: {path}") from exc
+    if not isinstance(registry, dict) or not isinstance(registry.get("columns"), list):
+        raise RuntimeError("Feature approval registry must contain a columns list.")
+    if not str(registry.get("registry_version", "")).strip():
+        raise RuntimeError("Feature approval registry requires registry_version.")
+    names: Dict[str, str] = {}
+    for entry in registry["columns"]:
+        if not isinstance(entry, dict) or not str(entry.get("name", "")).strip():
+            raise RuntimeError("Every feature registry entry requires a name.")
+        name = str(entry["name"])
+        key = name.casefold()
+        if key in names:
+            raise RuntimeError(
+                f"Feature registry has duplicate case-insensitive names: {names[key]}, {name}"
+            )
+        names[key] = name
+        status = str(entry.get("status", "")).upper()
+        if status not in FEATURE_REGISTRY_STATUSES:
+            raise RuntimeError(f"Feature registry status is invalid for {name}: {status}")
+        allowed = entry.get("allowed_schema_types", [])
+        if not isinstance(allowed, list) or not allowed:
+            raise RuntimeError(f"Feature registry requires allowed_schema_types for {name}.")
+    required_registry_status = {
+        TARGET_COLUMN.casefold(): "TARGET",
+        PCS_DATE_COLUMN.casefold(): "MANDATORY_METADATA",
+    }
+    by_name = {str(x["name"]).casefold(): str(x["status"]).upper()
+               for x in registry["columns"]}
+    for name, expected_status in required_registry_status.items():
+        if by_name.get(name) != expected_status:
+            raise RuntimeError(
+                f"Feature registry must classify {name} as {expected_status}."
+            )
+    checksum = hashlib.sha256(raw).hexdigest()
+    return registry, checksum
+
+
+def schema_type_of(series: pd.Series) -> str:
+    """Classify storage dtype without learning from values or Holdout targets."""
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return "datetime"
+    if pd.api.types.is_bool_dtype(series):
+        return "boolean"
+    if pd.api.types.is_numeric_dtype(series):
+        return "numeric"
+    if (
+        pd.api.types.is_object_dtype(series)
+        or pd.api.types.is_string_dtype(series)
+        or isinstance(series.dtype, pd.CategoricalDtype)
+    ):
+        return "text"
+    return "other"
+
+
+def _possible_target_leakage(column_name: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", column_name.casefold()).strip("_")
+    tokens = set(normalized.split("_"))
+    return bool(tokens & {
+        "price", "sold", "sale", "target", "actual", "revenue",
+        "transaction", "closed", "final",
+    })
+
+
+def evaluate_feature_approval_gate(df: pd.DataFrame, registry: dict,
+                                   registry_checksum: str) -> SchemaGateResult:
+    entries = {str(x["name"]).casefold(): x for x in registry["columns"]}
+    actual = {str(column).casefold(): str(column) for column in df.columns}
+    schema_payload = [
+        {"name": actual[key], "pandas_dtype": str(df[actual[key]].dtype),
+         "schema_type": schema_type_of(df[actual[key]])}
+        for key in sorted(actual)
+    ]
+    schema_fingerprint = hashlib.sha256(
+        json.dumps(schema_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    records: List[dict] = []
+    approved: List[str] = []
+    incompatible: List[str] = []
+
+    for key in sorted(actual):
+        name = actual[key]
+        observed_type = schema_type_of(df[name])
+        entry = entries.get(key)
+        if entry is None:
+            leakage_risk = _possible_target_leakage(name)
+            records.append({
+                "column_name": name,
+                "registry_status": "PENDING_REVIEW",
+                "schema_state": "NEW",
+                "observed_schema_type": observed_type,
+                "allowed_schema_types": [],
+                "training_authorized": False,
+                "predict_availability": "NOT_REVIEWED",
+                "target_leakage_risk": leakage_risk,
+                "reason": (
+                    "Unregistered column; possible target/post-outcome leakage."
+                    if leakage_risk else
+                    "Unregistered column; owner review is required."
+                ),
+            })
+            continue
+        status = str(entry["status"]).upper()
+        allowed_types = [str(x).lower() for x in entry["allowed_schema_types"]]
+        compatible = observed_type in allowed_types
+        authorized = status == "APPROVED" and compatible
+        if authorized:
+            approved.append(name)
+        elif status == "APPROVED" and not compatible:
+            incompatible.append(name)
+        records.append({
+            "column_name": name,
+            "registry_status": status,
+            "schema_state": "UNCHANGED" if compatible else "TYPE_CHANGED",
+            "observed_schema_type": observed_type,
+            "allowed_schema_types": allowed_types,
+            "training_authorized": authorized,
+            "predict_availability": entry.get("predict_availability", "NOT_REVIEWED"),
+            "target_leakage_risk": bool(entry.get("target_leakage_risk", False)),
+            "reason": (
+                str(entry.get("reason", ""))
+                if compatible else
+                "Observed schema type is not allowed by the registry; review required."
+            ),
+        })
+
+    missing_approved: List[str] = []
+    for key, entry in sorted(entries.items()):
+        if key in actual:
+            continue
+        status = str(entry["status"]).upper()
+        if status == "APPROVED":
+            missing_approved.append(str(entry["name"]))
+        records.append({
+            "column_name": str(entry["name"]),
+            "registry_status": status,
+            "schema_state": "MISSING",
+            "observed_schema_type": None,
+            "allowed_schema_types": entry["allowed_schema_types"],
+            "training_authorized": False,
+            "predict_availability": entry.get("predict_availability", "NOT_REVIEWED"),
+            "target_leakage_risk": bool(entry.get("target_leakage_risk", False)),
+            "reason": "Column listed in the registry is absent from this source schema.",
+        })
+
+    return SchemaGateResult(
+        registry_version=str(registry["registry_version"]),
+        registry_checksum=registry_checksum,
+        schema_fingerprint=schema_fingerprint,
+        initial_approval_status=str(
+            registry.get("initial_approval_status", "PENDING_OWNER_APPROVAL")
+        ).upper(),
+        approved_features=approved,
+        missing_approved_features=missing_approved,
+        incompatible_approved_features=incompatible,
+        records=records,
+    )
+
+
+def assert_feature_registry_approved(gate: SchemaGateResult) -> None:
+    if gate.initial_approval_status != "APPROVED":
+        raise RuntimeError(
+            "Initial Feature Approval Registry is not owner-approved; "
+            "Full Training is blocked. Review the Schema Review Report."
+        )
+    if not gate.approved_features:
+        raise RuntimeError("No present, type-compatible APPROVED predictors remain.")
+
+
+def export_schema_review_report(path: Path, gate: SchemaGateResult,
+                                pcs_date: pd.Timestamp, run_id: str) -> None:
+    payload = {
+        "report_version": "1.0",
+        "run_id": run_id,
+        "pcs_date": pcs_date.date().isoformat(),
+        "registry_version": gate.registry_version,
+        "registry_checksum": gate.registry_checksum,
+        "registry_initial_approval_status": gate.initial_approval_status,
+        "schema_fingerprint": gate.schema_fingerprint,
+        "approved_features_present_and_compatible": gate.approved_features,
+        "missing_approved_features": gate.missing_approved_features,
+        "incompatible_approved_features": gate.incompatible_approved_features,
+        "columns": gate.records,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def parse_single_pcs_date(df: pd.DataFrame) -> pd.Timestamp:
@@ -974,14 +1189,20 @@ def infer_eligible_features(df: pd.DataFrame) -> Tuple[List[str], List[Tuple[str
     return eligible, excluded
 
 
-def infer_candidate_universe(df: pd.DataFrame) -> List[str]:
-    """Discover candidate columns without learning value distributions."""
+def infer_candidate_universe(
+    df: pd.DataFrame,
+    approved_features: Sequence[str],
+) -> List[str]:
+    """Apply explicit authorization before any data-driven eligibility."""
+    approved = {str(c).casefold() for c in approved_features}
     force_include = {c.lower() for c in FORCE_INCLUDE_COLUMNS}
     force_exclude = {c.lower() for c in FORCE_EXCLUDE_COLUMNS}
     exact_exclude = {c.lower() for c in EXCLUDE_COLUMNS_EXACT}
     candidates = []
     for col in df.columns:
         lower = col.lower()
+        if lower not in approved:
+            continue
         if lower in force_include:
             candidates.append(col)
         elif lower in force_exclude or lower in exact_exclude:
@@ -1912,6 +2133,7 @@ def build_top1_model_bundle(
     model_id: str,
     run_id: str,
     pcs_date: pd.Timestamp,
+    schema_gate: Optional[SchemaGateResult] = None,
 ) -> dict:
     state = top_candidate.preprocessor
 
@@ -1967,6 +2189,14 @@ def build_top1_model_bundle(
         "ols_result": top_candidate.ols_result,
     }
 
+    if schema_gate is not None:
+        bundle["feature_approval"] = {
+            "registry_version": schema_gate.registry_version,
+            "registry_checksum": schema_gate.registry_checksum,
+            "schema_fingerprint": schema_gate.schema_fingerprint,
+            "approved_features_for_run": list(schema_gate.approved_features),
+        }
+
     return bundle
 
 
@@ -2000,6 +2230,7 @@ def planned_artifact_paths(pcs_date: pd.Timestamp, run_id: str) -> Dict[str, Pat
         "evaluation": analysis_dir / f"training_evaluation_{run_id}.csv",
         "holdout_predictions": analysis_dir / f"holdout_predictions_{run_id}.csv",
         "evaluation_metadata": analysis_dir / f"training_evaluation_metadata_{run_id}.json",
+        "schema_review": analysis_dir / f"schema_review_{run_id}.json",
     }
 
 
@@ -2023,6 +2254,7 @@ def export_evaluation_sidecars(
     source_positive_count: int,
     eligible_count: int,
     candidate_outcomes: Sequence[dict],
+    schema_gate: SchemaGateResult,
 ) -> None:
     rows = []
     for rank, candidate in enumerate(ranked_checkpoints, start=1):
@@ -2102,6 +2334,16 @@ def export_evaluation_sidecars(
         "eligible_rows": eligible_count,
         "excluded_by_cohort_rule": source_positive_count - eligible_count,
         "outlier_policy": "GROUP_BASED_SUSPECTED_OUTLIER_IS_FLAG_ONLY",
+        "feature_approval": {
+            "registry_version": schema_gate.registry_version,
+            "registry_checksum": schema_gate.registry_checksum,
+            "schema_fingerprint": schema_gate.schema_fingerprint,
+            "approved_features_for_run": list(schema_gate.approved_features),
+            "missing_approved_features": list(schema_gate.missing_approved_features),
+            "incompatible_approved_features": list(
+                schema_gate.incompatible_approved_features
+            ),
+        },
         "development_holdout_split": split_metadata,
         "development_cv_folds": fold_metadata,
         "candidate_outcomes": list(candidate_outcomes),
@@ -2170,6 +2412,22 @@ def main() -> None:
     paths = planned_artifact_paths(pcs_date, run_id)
     assert_no_artifact_collisions(paths)
 
+    registry, registry_checksum = load_feature_registry()
+    schema_gate = evaluate_feature_approval_gate(df, registry, registry_checksum)
+    export_schema_review_report(
+        paths["schema_review"], schema_gate, pcs_date, run_id
+    )
+    print(
+        f"[SCHEMA] Registry={schema_gate.registry_version} "
+        f"status={schema_gate.initial_approval_status}"
+    )
+    print(
+        f"[SCHEMA] Approved/present/type-compatible predictors: "
+        f"{len(schema_gate.approved_features)}"
+    )
+    print(f"[SCHEMA] Review report: {paths['schema_review']}")
+    assert_feature_registry_approved(schema_gate)
+
     # Price-quality screening is always informational: no suspected peer
     # outliers are removed just because they have a review flag.
     export_outlier_flag_only_reports(df, pcs_date, run_id)
@@ -2199,7 +2457,9 @@ def main() -> None:
     print(f"[CV] Fold checksum          : {fold_metadata['assignment_checksum']}")
     print("[PRICE FILTER] Peer-group SUSPECTED_OUTLIER flags are review-only.")
 
-    candidate_universe = infer_candidate_universe(development_df)
+    candidate_universe = infer_candidate_universe(
+        development_df, schema_gate.approved_features
+    )
 
     print(
         f"[INFO] Candidate universe ({len(candidate_universe)}): "
@@ -2372,6 +2632,7 @@ def main() -> None:
         model_id=top1_model_id,
         run_id=run_id,
         pcs_date=pcs_date,
+        schema_gate=schema_gate,
     )
 
     joblib.dump(
@@ -2392,6 +2653,7 @@ def main() -> None:
         source_positive_count=len(cleaned_df),
         eligible_count=len(eligible_df),
         candidate_outcomes=candidate_outcomes,
+        schema_gate=schema_gate,
     )
 
     print()

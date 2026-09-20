@@ -7,6 +7,7 @@ deserialization.  The module is compatible with both ``unittest`` and pytest.
 from __future__ import annotations
 
 import copy
+import json
 import os
 import tempfile
 import unittest
@@ -67,20 +68,28 @@ class DynamicSchemaTests(unittest.TestCase):
 
     def test_optional_columns_can_be_added_removed_or_renamed(self) -> None:
         base = training.normalize_required_column_names(self.source_with_snapshot())
-        base_universe = training.infer_candidate_universe(base)
+        base_universe = training.infer_candidate_universe(
+            base, ["brand", "model", "year", "mileage"]
+        )
 
         added = base.assign(new_optional_score=np.arange(len(base), dtype=float))
-        added_universe = training.infer_candidate_universe(added)
+        added_universe = training.infer_candidate_universe(
+            added, ["brand", "model", "year", "mileage", "new_optional_score"]
+        )
         self.assertNotIn("new_optional_score", base_universe)
         self.assertIn("new_optional_score", added_universe)
 
         removed = added.drop(columns=["new_optional_score", "year"])
-        removed_universe = training.infer_candidate_universe(removed)
+        removed_universe = training.infer_candidate_universe(
+            removed, ["brand", "model", "year", "mileage", "new_optional_score"]
+        )
         self.assertNotIn("new_optional_score", removed_universe)
         self.assertNotIn("year", removed_universe)
 
         renamed = base.rename(columns={"year": "registration_year"})
-        renamed_universe = training.infer_candidate_universe(renamed)
+        renamed_universe = training.infer_candidate_universe(
+            renamed, ["brand", "model", "registration_year", "mileage"]
+        )
         self.assertNotIn("year", renamed_universe)
         self.assertIn("registration_year", renamed_universe)
 
@@ -142,6 +151,136 @@ class DynamicSchemaTests(unittest.TestCase):
                 bundle,
                 training,
             )
+
+
+class FeatureApprovalGateTests(unittest.TestCase):
+    def registry(self, approved_status: str = "APPROVED") -> dict:
+        return {
+            "registry_version": "test-1",
+            "initial_approval_status": approved_status,
+            "columns": [
+                {"name": "price", "status": "TARGET",
+                 "allowed_schema_types": ["numeric"]},
+                {"name": "PCS_DATE", "status": "MANDATORY_METADATA",
+                 "allowed_schema_types": ["datetime"]},
+                {"name": "approved_feature", "status": "APPROVED",
+                 "allowed_schema_types": ["numeric"],
+                 "predict_availability": "AVAILABLE"},
+                {"name": "pending_feature", "status": "PENDING_REVIEW",
+                 "allowed_schema_types": ["numeric"],
+                 "predict_availability": "NOT_REVIEWED"},
+                {"name": "excluded_feature", "status": "EXCLUDED",
+                 "allowed_schema_types": ["numeric"],
+                 "predict_availability": "NOT_ALLOWED"},
+            ],
+        }
+
+    def frame(self) -> pd.DataFrame:
+        n = 40
+        approved = np.arange(n, dtype=float)
+        return pd.DataFrame({
+            "price": 100_000 + approved * 50_000,
+            "PCS_DATE": pd.to_datetime(["2026-09-20"] * n),
+            "approved_feature": approved,
+            # Deliberately stronger target relationship than the approved input.
+            "pending_feature": 100_000 + approved * 50_000,
+            "excluded_feature": approved * 2,
+        })
+
+    def gate(self, frame=None, registry=None):
+        return training.evaluate_feature_approval_gate(
+            self.frame() if frame is None else frame,
+            self.registry() if registry is None else registry,
+            "test-checksum",
+        )
+
+    def test_only_approved_feature_enters_candidate_universe(self) -> None:
+        frame = self.frame()
+        gate = self.gate(frame)
+        universe = training.infer_candidate_universe(
+            frame, gate.approved_features
+        )
+        self.assertEqual(universe, ["approved_feature"])
+        eligible, _ = training.infer_eligible_features(frame[universe])
+        self.assertEqual(eligible, ["approved_feature"])
+        self.assertNotIn("pending_feature", universe)
+        self.assertNotIn("excluded_feature", universe)
+
+    def test_new_feature_is_pending_and_registry_is_not_mutated(self) -> None:
+        registry = self.registry()
+        before = copy.deepcopy(registry)
+        frame = self.frame().assign(new_target_proxy=lambda x: x["price"])
+        gate = self.gate(frame, registry)
+        record = next(x for x in gate.records
+                      if x["column_name"] == "new_target_proxy")
+        self.assertEqual(record["registry_status"], "PENDING_REVIEW")
+        self.assertEqual(record["schema_state"], "NEW")
+        self.assertTrue(record["target_leakage_risk"])
+        self.assertFalse(record["training_authorized"])
+        self.assertEqual(registry, before)
+
+    def test_missing_and_renamed_approved_features_are_reported(self) -> None:
+        frame = self.frame().rename(
+            columns={"approved_feature": "renamed_feature"}
+        )
+        gate = self.gate(frame)
+        self.assertEqual(gate.missing_approved_features, ["approved_feature"])
+        renamed = next(x for x in gate.records
+                       if x["column_name"] == "renamed_feature")
+        self.assertEqual(renamed["registry_status"], "PENDING_REVIEW")
+        self.assertFalse(renamed["training_authorized"])
+
+    def test_unsupported_approved_type_change_is_not_authorized(self) -> None:
+        frame = self.frame()
+        frame["approved_feature"] = "changed meaning"
+        gate = self.gate(frame)
+        self.assertEqual(
+            gate.incompatible_approved_features, ["approved_feature"]
+        )
+        self.assertNotIn("approved_feature", gate.approved_features)
+        record = next(x for x in gate.records
+                      if x["column_name"] == "approved_feature")
+        self.assertEqual(record["schema_state"], "TYPE_CHANGED")
+
+    def test_initial_registry_requires_owner_approval(self) -> None:
+        gate = self.gate(registry=self.registry("PENDING_OWNER_APPROVAL"))
+        with self.assertRaisesRegex(RuntimeError, "not owner-approved"):
+            training.assert_feature_registry_approved(gate)
+
+    def test_project_registry_is_a_non_approved_initial_proposal(self) -> None:
+        registry, checksum = training.load_feature_registry()
+        gate = training.evaluate_feature_approval_gate(
+            self.frame(), registry, checksum
+        )
+        self.assertEqual(gate.initial_approval_status, "PENDING_OWNER_APPROVAL")
+        self.assertEqual(gate.approved_features, [])
+        with self.assertRaisesRegex(RuntimeError, "not owner-approved"):
+            training.assert_feature_registry_approved(gate)
+
+    def test_pending_feature_never_reaches_preprocessing(self) -> None:
+        frame = self.frame()
+        gate = self.gate(frame)
+        universe = training.infer_candidate_universe(
+            frame, gate.approved_features
+        )
+        state = training.fit_preprocessor(frame, universe)
+        self.assertNotIn("pending_feature", state.feature_groups)
+        self.assertNotIn("pending_feature", state.encoded_feature_names)
+
+    def test_schema_review_report_contains_metadata_without_row_values(self) -> None:
+        gate = self.gate()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "schema_review.json"
+            training.export_schema_review_report(
+                path, gate, pd.Timestamp("2026-09-20"), "20260920_140000"
+            )
+            text = path.read_text(encoding="utf-8")
+            payload = json.loads(text)
+        self.assertEqual(payload["registry_version"], "test-1")
+        self.assertEqual(payload["registry_checksum"], "test-checksum")
+        self.assertIn("schema_fingerprint", payload)
+        self.assertEqual(len(payload["columns"]), len(gate.records))
+        self.assertNotIn(str(self.frame()["price"].iloc[-1]), text)
 
 
 class SplitAndFoldTests(unittest.TestCase):
@@ -421,11 +560,22 @@ class FrozenRefitAndBundleTests(unittest.TestCase):
             cv_rmse=10.0,
             cv_mae=5.0,
         )
+        schema_gate = training.SchemaGateResult(
+            registry_version="approved-test-1",
+            registry_checksum="checksum",
+            schema_fingerprint="fingerprint",
+            initial_approval_status="APPROVED",
+            approved_features=["brand", "year", "mileage"],
+            missing_approved_features=[],
+            incompatible_approved_features=[],
+            records=[],
+        )
         bundle = training.build_top1_model_bundle(
             checkpoint,
             "20260920_120000",
             "20260920_120000",
             pd.Timestamp("2026-09-20"),
+            schema_gate=schema_gate,
         )
 
         required_legacy_keys = {
@@ -441,6 +591,13 @@ class FrozenRefitAndBundleTests(unittest.TestCase):
         }
         self.assertTrue(required_legacy_keys.issubset(bundle))
         self.assertTrue(required_preprocessor_keys.issubset(bundle["preprocessor"]))
+        self.assertEqual(
+            bundle["feature_approval"]["registry_version"], "approved-test-1"
+        )
+        self.assertEqual(
+            bundle["feature_approval"]["approved_features_for_run"],
+            ["brand", "year", "mileage"],
+        )
 
         restored = make_state(bundle, training)
         expected_medians = {

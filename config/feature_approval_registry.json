@@ -1,0 +1,37 @@
+{
+  "registry_version": "2026-09-20-draft-1",
+  "initial_approval_status": "PENDING_OWNER_APPROVAL",
+  "scope": "dbo.STG_USED_CAR",
+  "evidence": "Initial proposal from source-code rules, UI inputs, historical model metadata, and the local raw CSV header; current SQL Server schema has not been queried.",
+  "columns": [
+    {"name": "price", "status": "TARGET", "allowed_schema_types": ["numeric", "text"], "predict_availability": "NOT_REQUIRED_AT_PREDICTION", "target_leakage_risk": true, "reason": "OLS target; never a predictor."},
+    {"name": "PCS_DATE", "status": "MANDATORY_METADATA", "allowed_schema_types": ["datetime", "text"], "predict_availability": "NOT_REQUIRED_AT_PREDICTION", "target_leakage_risk": false, "reason": "Required latest-snapshot date; never a predictor."},
+
+    {"name": "brand", "status": "PENDING_REVIEW", "allowed_schema_types": ["text"], "predict_availability": "AVAILABLE_IN_CLI_AND_UI", "target_leakage_risk": false, "reason": "Historical predictor and available at prediction time; requires first owner approval."},
+    {"name": "model", "status": "PENDING_REVIEW", "allowed_schema_types": ["text"], "predict_availability": "AVAILABLE_IN_CLI_AND_UI", "target_leakage_risk": false, "reason": "Historical predictor and available at prediction time; requires first owner approval."},
+    {"name": "sub_model", "status": "PENDING_REVIEW", "allowed_schema_types": ["text"], "predict_availability": "AVAILABLE_IN_CLI_AND_UI", "target_leakage_risk": false, "reason": "Historical optional predictor and available at prediction time; requires first owner approval."},
+    {"name": "model_year", "status": "PENDING_REVIEW", "allowed_schema_types": ["numeric", "text"], "predict_availability": "AVAILABLE_IN_CLI_AND_UI", "target_leakage_risk": false, "reason": "Historical predictor; numeric-like text is allowed only after fold-train validation."},
+    {"name": "mileage", "status": "PENDING_REVIEW", "allowed_schema_types": ["numeric", "text"], "predict_availability": "AVAILABLE_IN_CLI_AND_UI", "target_leakage_risk": false, "reason": "Historical predictor; numeric-like text is allowed only after fold-train validation."},
+    {"name": "fuel_type", "status": "PENDING_REVIEW", "allowed_schema_types": ["text"], "predict_availability": "AVAILABLE_IN_CLI_AND_UI", "target_leakage_risk": false, "reason": "Historical predictor and available at prediction time; requires first owner approval."},
+    {"name": "transmission", "status": "PENDING_REVIEW", "allowed_schema_types": ["text"], "predict_availability": "AVAILABLE_IN_CLI_AND_UI", "target_leakage_risk": false, "reason": "Candidate feature in prior code; requires business approval."},
+    {"name": "engine_size", "status": "PENDING_REVIEW", "allowed_schema_types": ["numeric", "text"], "predict_availability": "AVAILABLE_IN_CLI_AND_UI", "target_leakage_risk": false, "reason": "Historical predictor; numeric-like text is allowed only after fold-train validation."},
+    {"name": "body_type", "status": "PENDING_REVIEW", "allowed_schema_types": ["text"], "predict_availability": "AVAILABLE_IN_CLI_AND_UI", "target_leakage_risk": false, "reason": "Historical predictor and available at prediction time; requires first owner approval."},
+    {"name": "color", "status": "PENDING_REVIEW", "allowed_schema_types": ["text"], "predict_availability": "AVAILABLE_IN_CLI_AND_UI", "target_leakage_risk": false, "reason": "Historical predictor and available at prediction time; requires first owner approval."},
+    {"name": "number_of_seats", "status": "PENDING_REVIEW", "allowed_schema_types": ["numeric", "text"], "predict_availability": "AVAILABLE_IN_CLI_AND_UI", "target_leakage_risk": false, "reason": "Historical predictor; numeric-like text is allowed only after fold-train validation."},
+    {"name": "province", "status": "PENDING_REVIEW", "allowed_schema_types": ["text"], "predict_availability": "NO_CURRENT_EXPLICIT_UI_CONTROL", "target_leakage_risk": false, "reason": "Prediction-time input contract and business meaning require review."},
+    {"name": "location", "status": "PENDING_REVIEW", "allowed_schema_types": ["text"], "predict_availability": "NO_CURRENT_EXPLICIT_UI_CONTROL", "target_leakage_risk": false, "reason": "Prediction-time input contract and business meaning require review."},
+    {"name": "seller_name", "status": "PENDING_REVIEW", "allowed_schema_types": ["text"], "predict_availability": "NO_CURRENT_EXPLICIT_UI_CONTROL", "target_leakage_risk": false, "reason": "Potential identity/cardinality and prediction-availability concerns require review."},
+    {"name": "seller_type", "status": "PENDING_REVIEW", "allowed_schema_types": ["text"], "predict_availability": "NO_CURRENT_EXPLICIT_UI_CONTROL", "target_leakage_risk": false, "reason": "Prediction-time input contract and business meaning require review."},
+
+    {"name": "listing_id", "status": "EXCLUDED", "allowed_schema_types": ["numeric", "text"], "predict_availability": "IDENTIFIER_ONLY", "target_leakage_risk": false, "reason": "Technical listing identifier; used only for duplicate grouping/audit."},
+    {"name": "source_url", "status": "EXCLUDED", "allowed_schema_types": ["text"], "predict_availability": "IDENTIFIER_ONLY", "target_leakage_risk": false, "reason": "Source identifier and duplicate-group aid; never a predictor."},
+    {"name": "title", "status": "EXCLUDED", "allowed_schema_types": ["text"], "predict_availability": "NOT_SUPPORTED", "target_leakage_risk": true, "reason": "Unstructured listing text can contain price or post-outcome information."},
+    {"name": "raw_price", "status": "EXCLUDED", "allowed_schema_types": ["numeric", "text"], "predict_availability": "NOT_ALLOWED", "target_leakage_risk": true, "reason": "Raw representation of the target price."},
+    {"name": "raw_mileage", "status": "EXCLUDED", "allowed_schema_types": ["numeric", "text"], "predict_availability": "NOT_SUPPORTED", "target_leakage_risk": false, "reason": "Raw duplicate of cleaned mileage; excluded by source-code policy."},
+    {"name": "seller_url", "status": "EXCLUDED", "allowed_schema_types": ["text"], "predict_availability": "NOT_SUPPORTED", "target_leakage_risk": false, "reason": "URL/identifier excluded by source-code policy."},
+    {"name": "image_url", "status": "EXCLUDED", "allowed_schema_types": ["text"], "predict_availability": "NOT_SUPPORTED", "target_leakage_risk": false, "reason": "URL excluded by source-code policy."},
+    {"name": "description", "status": "EXCLUDED", "allowed_schema_types": ["text"], "predict_availability": "NOT_SUPPORTED", "target_leakage_risk": true, "reason": "Unstructured listing text can contain target price or unavailable information."},
+    {"name": "scraped_at", "status": "EXCLUDED", "allowed_schema_types": ["datetime", "text"], "predict_availability": "NOT_SUPPORTED", "target_leakage_risk": false, "reason": "Collection metadata excluded by source-code policy."},
+    {"name": "dealer_slug", "status": "EXCLUDED", "allowed_schema_types": ["text"], "predict_availability": "NOT_SUPPORTED", "target_leakage_risk": false, "reason": "Technical seller identifier excluded by source-code policy."}
+  ]
+}
