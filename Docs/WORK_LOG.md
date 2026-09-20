@@ -457,3 +457,11 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python scripts/validate_schema_registry.py \
 ```
 
 สถานะ: Registry+metadata validationเสร็จ รอ ownerอนุมัติ Controlled V4 Trainingแยกต่างหาก
+
+## 2026-09-20 — Root README คู่มือภาษาไทย
+
+- สร้าง `README.md` เป็นคู่มือหลักของ Project ครอบคลุม Project Overview, Quick Start, Project Structure, Python 8 ไฟล์, Shell 2 ไฟล์, Feature Approval/Dynamic Schema, Training V4, artifact dictionary, Prediction, evaluation limitations, runbook, troubleshooting และ documentation index
+- ตรวจคำสั่ง/arguments/environment/output pathsจาก sourceจริง ไม่มีการรัน Training, Prediction, SQL query, Streamlitหรือ testsเพื่อสร้างตัวอย่าง
+- ระบุข้อเท็จจริงสำคัญ: ไม่มี dependency manifest/lockfile, analyze/plotใช้ in-sample snapshot diagnostics, Plotมีข้อความ historical mean-foldที่ไม่ตรง pooled OOF semanticsของ Training V4 และ default prediction pathอาจเขียนทับผล runเดิมหากไม่กำหนด `--output-csv`
+- ตรวจ Python/Shell inventory, relative links/explicit anchors, code fences/Mermaid, RESULT 18/COEFFICIENT 13 columns, secret patterns, `git diff --check` และ Git status
+- แก้เฉพาะ `README.md` และ sectionนี้ใน `Docs/WORK_LOG.md`; ไม่แก้ Python, Shell, Registry, Data Dictionary, Databaseหรือ artifacts และไม่ Commit/Push
