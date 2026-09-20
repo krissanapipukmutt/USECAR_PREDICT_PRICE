@@ -7,7 +7,7 @@
 ## สารบัญ
 
 - [1. Project Overview](#project-overview)
-- [2. Quick Start](#quick-start)
+- [2. คำสั่งทั้งหมดที่ใช้บ่อย — Copy & Run](#quick-start)
 - [3. Project Structure](#project-structure)
 - [4. คู่มือ Python ทุกไฟล์](#python-files)
 - [5. Shell Scripts และ Runners](#shell-scripts)
@@ -71,19 +71,41 @@ flowchart TD
 Training Workflow อ่าน DB, ตรวจ Registry/Schema, สร้าง Development/Holdout และ CV, fit OLS แล้วเขียน artifacts ส่วน Prediction Workflow โหลด Rank-1 `.joblib` ที่มี frozen feature schema/preprocessor และไม่ retrain
 
 <a id="quick-start"></a>
-## 2. Quick Start
+## 2. คำสั่งทั้งหมดที่ใช้บ่อย — Copy & Run
 
-### 2.1 เปิดโปรเจกต์บน Mac / VS Code Terminal
+คำสั่งทุก block ด้านล่างเริ่มจาก Project Root และใช้ `.venv/bin/python` โดยตรง จึงไม่ต้อง activate virtual environment ก่อน คำสั่งที่แตะ SQL Server อ่านข้อมูลเท่านั้นตาม implementation ปัจจุบัน แต่ Training, Analyze และ Plot อ่านข้อมูลรถจริงจาก STG; Schema Review อ่านเฉพาะ metadata
+
+### 2.1 ตั้งค่า Project / ตรวจ Python
+
+**When to run:** ทุกครั้งที่เปิด Terminal ใหม่เพื่อยืนยัน path และ Python
+**Requires SQL Server:** No
 
 ```bash
 cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
-source .venv/bin/activate
-python --version
+.venv/bin/python --version
 ```
 
-`.venv` มีอยู่ใน Workspace แต่ถูก Git ignore หากต้องสร้างใหม่ ต้องจัดทำ dependency manifest และตรวจเวอร์ชันก่อน ปัจจุบันไม่ควรเดาคำสั่งติดตั้ง dependencies จาก README นี้
+**Expected output:** แสดง Python version โดยไม่สร้างไฟล์
+**ข้อควรระวัง:** โปรเจกต์ยังไม่มี dependency manifest/lockfile จึงไม่ควรเดาคำสั่งติดตั้ง package ใหม่จาก README
 
-### 2.2 Environment Variables
+### 2.2 ตั้งค่า SQL Server Password บน macOS zsh
+
+ใช้ block นี้ก่อนคำสั่ง Training, Analyze, Plot หรือ Streamlit ที่ต้องสร้าง dropdown catalog ตัว Password จะไม่ปรากฏบนหน้าจอและไม่ถูกใส่ใน shell history
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+read -rs "USED_CAR_DB_PASSWORD?SQL Server password: "
+echo
+export USED_CAR_DB_PASSWORD
+```
+
+เมื่อทำงานเสร็จให้ล้างค่าจาก Terminal session:
+
+```bash
+unset USED_CAR_DB_PASSWORD
+```
+
+ค่าการเชื่อมต่อที่ source รองรับ:
 
 ค่าที่เกี่ยวข้องกับฐานข้อมูล:
 
@@ -98,52 +120,189 @@ python --version
 | `USED_CAR_DB_SCHEMA` | `dbo` |
 | `USED_CAR_SOURCE_TABLE` | `STG_USED_CAR` |
 
-อย่าใส่ Password ลงไฟล์, README หรือ command line ใช้ hidden prompt เช่น:
+### 2.3 ตรวจ Actual Schema
+
+**When to run:** ก่อนพิจารณา Feature Registry หรือก่อน Training เมื่อ source schema อาจเปลี่ยน
+**Requires SQL Server:** Yes — metadata only; runner จะถาม Password แบบไม่แสดงบนหน้าจอถ้ายังไม่ได้ export
 
 ```bash
-IFS= read -r -s -p "SQL Server password: " USED_CAR_DB_PASSWORD; echo
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+./scripts/run_schema_review.sh --output "output/analysis/schema_review/actual_schema_manual_$(date '+%Y%m%d_%H%M%S').json"
+```
+
+**Expected output:** JSON metadata ใหม่ใน `output/analysis/schema_review/`
+**ข้อควรระวัง:** อ่านเพียง `INFORMATION_SCHEMA.COLUMNS`; output path เดิมจะไม่ถูกเขียนทับ
+
+### 2.4 Validate Registry แบบ Offline
+
+**When to run:** หลังมี Schema Report และก่อน Training
+**Requires SQL Server:** No
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python scripts/validate_schema_registry.py \
+  output/analysis/schema_review/actual_schema_20260920_130140.json
+```
+
+**Expected output:** JSON comparison บน Terminal; exit code `0` เมื่อ valid และ `1` เมื่อมี issue
+**ข้อควรระวัง:** คำสั่งนี้ไม่เปลี่ยนสถานะ approval
+
+### 2.5 Train Model
+
+**When to run:** เมื่อ Registry/Schema ผ่านและเจ้าของ Project อนุมัติ Training แล้ว
+**Requires SQL Server:** Yes — อ่าน snapshot จริงและเริ่ม Full Training จริง
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+read -rs "USED_CAR_DB_PASSWORD?SQL Server password: "
+echo
 export USED_CAR_DB_PASSWORD
-# รันคำสั่งที่ได้รับอนุมัติ
+./scripts/run_training_v4.sh
 unset USED_CAR_DB_PASSWORD
 ```
 
-ข้อความใน shell history จะมีเพียงชื่อตัวแปร ไม่มีค่ารหัสผ่าน
+**Expected output:** `output/train/YYYYMMDD/`, `output/analysis/YYYYMMDD/` และ `logs/train_YYYYMMDD_HHMMSS.log` โดยใช้ RUN_ID เดียวกัน
+**ข้อควรระวัง:** ไม่ใช่ dry run; runner ปฏิเสธ log/artifact collision และตรวจ artifact หลักสามไฟล์
 
-### 2.3 คำสั่งหลัก
+### 2.6 ดูรายชื่อ Features ของ Model
 
-| งาน | คำสั่ง | ต้องใช้ SQL Server |
-| --- | --- | --- |
-| ตรวจ Actual Schema | `./scripts/run_schema_review.sh` | ใช่; metadata only |
-| เทียบ Schema Report กับ Registry | ดูคำสั่งด้านล่าง | ไม่ใช้ |
-| Train Model | `./scripts/run_training_v4.sh` | ใช่; เป็น Training จริง ต้องได้รับอนุมัติ |
-| รัน tests | `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest discover -s tests -v` | ไม่ใช้ |
-| ดู feature ของ saved model | `.venv/bin/python predict_used_car_ols.py --run-id <RUN_ID> --show-features` | ไม่ใช้ |
-| Predict รถหนึ่งคัน | ดู [Prediction Guide](#prediction-guide) | ไม่ใช้ |
-| Predict CSV | `.venv/bin/python predict_used_car_ols.py --run-id <RUN_ID> --input-csv <INPUT.csv> --output-csv <OUTPUT.csv>` | ไม่ใช้ |
-| เปิด Streamlit | `.venv/bin/python -m streamlit run app_used_car.py` | ใช้ DB สำหรับ dropdown catalog เมื่อโมเดลใช้ brand/model/sub_model |
-| สร้าง analysis CSV | `.venv/bin/python analyze_used_car_ols.py` | ใช่ |
-| สร้างกราฟ | `.venv/bin/python plot_used_car_ols.py` | ใช่ |
-
-ตรวจ Schema แบบปลอดภัย:
+**When to run:** ก่อนเตรียม input เพื่อดู frozen input contract ของ Run
+**Requires SQL Server:** No
 
 ```bash
-./scripts/run_schema_review.sh
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+.venv/bin/python predict_used_car_ols.py \
+  --run-id 20260920_222201 \
+  --show-features
 ```
 
-จากนั้นเทียบ report ที่สร้างกับ Registry โดยไม่เชื่อม DB:
+**Expected output:** numeric medians, categorical levels และ reference categories บน Terminal
+**ข้อควรระวัง:** โหลดเฉพาะ `.joblib` ที่เชื่อถือได้
+
+### 2.7 Predict รถ 1 คัน
+
+**When to run:** เมื่อต้องการ point prediction จาก saved model
+**Requires SQL Server:** No
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 .venv/bin/python scripts/validate_schema_registry.py \
-  output/analysis/schema_review/actual_schema_<TIMESTAMP>.json
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+.venv/bin/python predict_used_car_ols.py \
+  --run-id 20260920_222201 \
+  --brand Toyota \
+  --model CAMRY \
+  --sub_model "2.5 HEV Premium" \
+  --model_year 2022 \
+  --mileage 45000 \
+  --fuel_type Hybrid \
+  --transmission Automatic \
+  --engine_size 2.5 \
+  --body_type Sedan \
+  --color Black \
+  --number_of_seats 5 \
+  --output-csv output/predict/20260918/toyota_camry_cli_20260920_222201.csv
 ```
 
-Train จริงหลังได้รับอนุมัติและตั้ง environment แล้ว:
+**Expected output:** CSV ชื่อใหม่ตาม path ที่ระบุและสรุปราคาบน Terminal
+**ข้อควรระวัง:** category case-sensitive; `CAMRY` ต่างจาก `Camry` และ `2.5 HEV Premium` อาจ map เป็น `__OTHER__`; ผลไม่ใช่ราคาตลาดที่รับประกัน
+
+### 2.8 สร้าง CSV Template
+
+**When to run:** ก่อนจัดทำ batch input ตามลำดับ feature ของ model
+**Requires SQL Server:** No
 
 ```bash
-./scripts/run_training_v4.sh
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+.venv/bin/python predict_used_car_ols.py \
+  --run-id 20260920_222201 \
+  --write-template \
+  --output-csv output/predict/20260918/camry_batch_template_20260920_222201.csv
 ```
 
-ตรวจผล Training หลักจาก `output/train/<PCS_DATE>/` และ V4 evaluation จาก `output/analysis/<PCS_DATE>/` ก่อนใช้โมเดล
+**Expected output:** CSV header ครบ 11 inputs ที่ path ระบุ
+**ข้อควรระวัง:** กรอกทุก required column แล้วบันทึกเป็นไฟล์ input ใหม่ก่อน predict
+
+### 2.9 Predict หลายคันจาก CSV
+
+**When to run:** เมื่อมีรถหลายแถว; block นี้สร้าง synthetic input สองแถวก่อนแล้วจึง predict
+**Requires SQL Server:** No
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+mkdir -p output/predict/20260918
+cat > output/predict/20260918/cars_to_predict_camry_example.csv <<'CSV'
+brand,model,sub_model,model_year,mileage,fuel_type,transmission,engine_size,body_type,color,number_of_seats
+Toyota,CAMRY,2.5 HEV Premium,2022,45000,Hybrid,Automatic,2.5,Sedan,Black,5
+Toyota,CAMRY,2.5 HEV Premium,2022,65000,Hybrid,Automatic,2.5,Sedan,Black,5
+CSV
+.venv/bin/python predict_used_car_ols.py \
+  --run-id 20260920_222201 \
+  --input-csv output/predict/20260918/cars_to_predict_camry_example.csv \
+  --output-csv output/predict/20260918/camry_batch_predictions_20260920_222201.csv
+```
+
+**Expected output:** prediction CSV สองแถวที่ชื่อไม่ชน default output
+**ข้อควรระวัง:** ตรวจ header/encoding และใช้ category spelling/case ตาม model
+
+### 2.10 เปิด Streamlit
+
+**When to run:** เมื่อต้องการ UI สำหรับเลือก model และ predict รถทีละคัน
+**Requires SQL Server:** Yes ตาม implementation ปัจจุบัน เพื่อสร้าง dropdown catalog จาก STG
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+read -rs "USED_CAR_DB_PASSWORD?SQL Server password: "
+echo
+export USED_CAR_DB_PASSWORD
+.venv/bin/python -m streamlit run app_used_car.py
+```
+
+**Expected output:** URL ของ local Streamlit app บน Terminal; ผลดาวน์โหลด CSV อยู่ใน browser
+**ข้อควรระวัง:** UI ไม่ retrain; catalog snapshot อาจต่างจาก PCS_DATE ของ model
+
+### 2.11 วิเคราะห์ Model
+
+**When to run:** เมื่อต้องการ in-sample diagnostics ของ Run ที่ source กำหนดไว้
+**Requires SQL Server:** Yes
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+read -rs "USED_CAR_DB_PASSWORD?SQL Server password: "
+echo
+export USED_CAR_DB_PASSWORD
+.venv/bin/python analyze_used_car_ols.py
+```
+
+**Expected output:** `output/analysis/20260918/00_overview_20260920_011528.csv` ถึง `06_all_in_sample_predictions_20260920_011528.csv` เมื่อ STG snapshot ตรง
+**ข้อควรระวัง:** source ปัจจุบัน hardcode Run `20260920_011528`; ไม่ได้เลือก `20260920_222201` อัตโนมัติ และผลเป็น in-sample ไม่ใช่ Holdout
+
+### 2.12 สร้างกราฟ
+
+**When to run:** เมื่อต้องการกราฟ diagnostics ของ latest complete run
+**Requires SQL Server:** Yes
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+read -rs "USED_CAR_DB_PASSWORD?SQL Server password: "
+echo
+export USED_CAR_DB_PASSWORD
+.venv/bin/python plot_used_car_ols.py
+```
+
+**Expected output:** PNG 5 ไฟล์ใน `output/graphs/20260918/` หาก latest complete run และ STG เป็น snapshot `20260918`
+**ข้อควรระวัง:** `RUN_ID=None` เลือก complete run ที่มี RUN_ID ล่าสุด ไม่ได้หมายถึง PCS_DATE ล่าสุด; actual/predicted plots เป็น in-sample
+
+### 2.13 Run Tests
+
+**When to run:** หลังแก้ Training V4, Registry Gate หรือ output contracts และก่อนเสนอ Commit
+**Requires SQL Server:** No
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest tests.test_training_evaluation_v4 -v
+```
+
+**Expected output:** unittest results บน Terminal ไม่มี training artifacts
+**ข้อควรระวัง:** เป็น synthetic automated tests ไม่ใช่ Training และไม่ยืนยัน runtime SQL Server
 
 <a id="project-structure"></a>
 ## 3. Project Structure
@@ -193,125 +352,346 @@ USECAR_PREDICT_PRICE/
 <a id="python-files"></a>
 ## 4. คู่มือ Python ทุกไฟล์
 
-Workspace มี Python 8 ไฟล์: Application 5, schema tools 2 และ test module 1
+Workspace มี Python 8 ไฟล์ แต่ละหัวข้อต่อไปนี้มีคำสั่งหลักครบในตัวเอง
 
 ### 4.1 [`train_used_car_ols.py`](train_used_car_ols.py)
 
-- **ใช้เมื่อ:** ได้รับอนุมัติให้ Train OLS ใหม่
-- **Input:** `SELECT *` จาก configured source table, Feature Registry, DB environment
-- **Prerequisites:** SQL Server/ODBC, Password environment, Registry approved, snapshot มี `price` และ `PCS_DATE`
-- **Command:** ควรเรียกผ่าน `./scripts/run_training_v4.sh`; รันไฟล์ตรงได้แต่จะไม่มี runner checks/log orchestration
-- **Arguments:** ไม่มี argparse; `USED_CAR_RUN_ID` optional และต้องเป็น `YYYYMMDD_HHMMSS`
-- **Process:** schema gate → price/outlier audit → eligible cohort → group-safe split/CV → OLS/backward elimination → ranking → Rank-1 holdout → frozen full-data refit → export
-- **Output:** artifacts ทุกประเภทใน [Artifact Dictionary](#artifacts)
-- **Side effects:** อ่าน snapshot ทั้งตารางและเขียนหลายไฟล์ ไม่ทำ DDL/DML
-- **Common errors:** Password หาย, Registry ไม่ approved, Schema drift, PCS_DATE หลายค่า, RUN_ID ชนไฟล์เดิม, candidate ไม่เพียงพอ
-- **ความสัมพันธ์:** สร้าง joblib/CSV ให้ predictor, UI, analyze และ plot
+**ทำอะไร:** อ่าน latest snapshot จาก SQL Server, ผ่าน Schema/Feature Approval Gate, สร้าง Eligible Dataset `price > 1,000`, ประเมิน OLS candidates ด้วย Development CV และ Holdout แล้ว refit Rank 1 บน eligible full data
 
+**ควรรันเมื่อไร:** เมื่อ Registry/Schema พร้อมและเจ้าของ Project อนุมัติ Training ใหม่แล้ว ไม่ต้องรันเพื่อ Predict จาก model ที่มีอยู่
+
+**ต้องเตรียม:** SQL Server/ODBC, DB environment, Password, approved Registry, source ที่มี `price` และ `PCS_DATE`
+
+**COPY-PASTE COMMAND — วิธีแนะนำผ่าน runner:**
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+read -rs "USED_CAR_DB_PASSWORD?SQL Server password: "
+echo
+export USED_CAR_DB_PASSWORD
+./scripts/run_training_v4.sh
+unset USED_CAR_DB_PASSWORD
+```
+
+**ตัวอย่างรัน Python โดยตรง:** block นี้สร้าง RUN_ID ใหม่ แต่ไม่มี runner logging, credential scan และ post-run artifact checks
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+read -rs "USED_CAR_DB_PASSWORD?SQL Server password: "
+echo
+export USED_CAR_DB_PASSWORD
+export USED_CAR_RUN_ID="$(date '+%Y%m%d_%H%M%S')"
+.venv/bin/python train_used_car_ols.py
+unset USED_CAR_DB_PASSWORD
+unset USED_CAR_RUN_ID
+```
+
+**ระหว่าง Run:** ตรวจ dynamic schema/mandatory columns/Registry, ทำ price quality และ flag outlier, split Development/Holdout แบบ group-safe, ใช้ common folds, fit preprocessing/feature selection ภายใน fold, rank ด้วย CV RMSE/MAE, evaluate Rank 1 บน Holdout และ refit/export
+
+**เมื่อสำเร็จ:** RESULT, COEFFICIENT และ Rank-1 joblib อยู่ใน `output/train/YYYYMMDD/`; reports อยู่ใน `output/analysis/YYYYMMDD/`; runner เพิ่ม `logs/train_RUN_ID.log` ตรวจบรรทัด `[RUN] RUN_ID=...` และสรุป artifact ตอนท้าย
+
+**ขั้นตอนต่อไป:** ตรวจ evaluation metadata, RESULT/COEFFICIENT และ log แล้วใช้ `predict_used_car_ols.py --show-features`
+
+**ข้อควรระวัง:** เป็น Full Training ด้วย SQL Server จริง ไม่ใช่ dry run; ไม่ทำ DDL/DML; outlier แบบ group ยังเป็น flag-only; RUN_ID ชนไฟล์เดิมจะถูกปฏิเสธ
+
+<a id="predict-python-runbook"></a>
 ### 4.2 [`predict_used_car_ols.py`](predict_used_car_ols.py)
 
-- **ใช้เมื่อ:** Predict ด้วย Rank-1 saved model โดยไม่ต่อ DB
-- **Input:** trusted `used_car_models_<RUN_ID>.joblib` และ direct/JSON/CSV input
-- **Prerequisites:** matching `train_used_car_ols.py`, dependencies และ model bundle
-- **Commands:** ดู [Prediction Guide](#prediction-guide)
-- **Arguments:** `--run-id`, `--car-json`, `--input-csv`, `--write-template`, `--show-features`, `--output-csv`, `--feature NAME=VALUE`; dynamic `NAME=VALUE` หรือ `--NAME VALUE` ก็รองรับ
-- **Process:** ตรวจ bundle/run/folder → restore frozen preprocessor → validate required inputs → encode → OLS predict → diagnostics
-- **Output:** `output/predict/<PCS_DATE>/used_car_predictions_<RUN_ID>.csv` หรือ path จาก `--output-csv`; template ชื่อ `cars_to_predict_template_<RUN_ID>.csv`
-- **Side effects:** อ่าน trusted joblib และเขียน CSV เท่านั้น Default prediction filenameของ runเดิมอาจถูกเขียนทับ จึงควรใช้ `--output-csv` สำหรับหลายชุด
-- **Common errors:** model ไม่พบ, RUN_ID/folder mismatch, missing inputs, duplicated column names, unexpected direct feature, encoded schema ไม่ตรง coefficients
+**ทำอะไร:** โหลด frozen feature schema/preprocessor และ Rank-1 OLS จาก trusted `.joblib` เพื่อทำนายโดยไม่อ่าน SQL Serverและไม่ retrain
+
+**ควรรันเมื่อไร:** เมื่อต้องการดู input contract หรือ Predict รถหนึ่ง/หลายคัน ไม่ต้องรันหากต้องการ dropdown UI
+
+**ต้องเตรียม:** `output/train/20260918/used_car_models_20260920_222201.joblib`; CSV input ต้องมี 11 required columns
+
+**COPY-PASTE A — ดู Features:**
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+.venv/bin/python predict_used_car_ols.py --run-id 20260920_222201 --show-features
+```
+
+**COPY-PASTE B — รถ 1 คันผ่าน CLI ครบ 11 inputs:**
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+.venv/bin/python predict_used_car_ols.py \
+  --run-id 20260920_222201 \
+  --brand Toyota \
+  --model CAMRY \
+  --sub_model "2.5 HEV Premium" \
+  --model_year 2022 \
+  --mileage 45000 \
+  --fuel_type Hybrid \
+  --transmission Automatic \
+  --engine_size 2.5 \
+  --body_type Sedan \
+  --color Black \
+  --number_of_seats 5 \
+  --output-csv output/predict/20260918/toyota_camry_cli_20260920_222201.csv
+```
+
+**COPY-PASTE C — รถ 1 คันด้วย JSON ครบ 11 inputs:**
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+.venv/bin/python predict_used_car_ols.py \
+  --run-id 20260920_222201 \
+  --car-json '{"brand":"Toyota","model":"CAMRY","sub_model":"2.5 HEV Premium","model_year":2022,"mileage":45000,"fuel_type":"Hybrid","transmission":"Automatic","engine_size":2.5,"body_type":"Sedan","color":"Black","number_of_seats":5}' \
+  --output-csv output/predict/20260918/toyota_camry_json_20260920_222201.csv
+```
+
+**COPY-PASTE D — สร้าง Template:**
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+.venv/bin/python predict_used_car_ols.py \
+  --run-id 20260920_222201 \
+  --write-template \
+  --output-csv output/predict/20260918/camry_batch_template_20260920_222201.csv
+```
+
+กรอกทุกคอลัมน์แล้ว Save As เป็น input CSV ใหม่ อย่าใช้ template เปล่าทำนาย
+
+**COPY-PASTE E — สร้าง synthetic CSV แล้ว Predict หลายคัน:**
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+mkdir -p output/predict/20260918
+cat > output/predict/20260918/cars_to_predict_camry_example.csv <<'CSV'
+brand,model,sub_model,model_year,mileage,fuel_type,transmission,engine_size,body_type,color,number_of_seats
+Toyota,CAMRY,2.5 HEV Premium,2022,45000,Hybrid,Automatic,2.5,Sedan,Black,5
+Toyota,CAMRY,2.5 HEV Premium,2022,65000,Hybrid,Automatic,2.5,Sedan,Black,5
+CSV
+.venv/bin/python predict_used_car_ols.py \
+  --run-id 20260920_222201 \
+  --input-csv output/predict/20260918/cars_to_predict_camry_example.csv \
+  --output-csv output/predict/20260918/camry_batch_predictions_20260920_222201.csv
+```
+
+**ระหว่าง Run:** ตรวจ bundle, restore preprocessor, validate input, map categories, จัด encoded columns ให้ตรง fitted parameters แล้ว predict
+
+**เมื่อสำเร็จ:** CSV มี input, model metadata, `PREDICTED_PRICE_THB`, `NEGATIVE_PREDICTION` และ mapping diagnostics ตรวจ Terminal summary และไฟล์ที่กำหนด
+
+**ขั้นตอนต่อไป:** ตรวจ negative/category mapping และใช้ชื่อ output ใหม่ทุกชุด
+
+**ข้อควรระวัง:** category case-sensitive; `CAMRY` ต่างจาก `Camry`; `2.5 HEV Premium` อาจ map เป็น `__OTHER__`; ผลไม่ใช่ราคาตลาดที่รับประกัน; default output เขียนทับได้; โหลดเฉพาะ trusted joblib
 
 ### 4.3 [`app_used_car.py`](app_used_car.py)
 
-- **ใช้เมื่อ:** ต้องการ UI ทำนายรถทีละคัน
-- **Input:** saved joblib และ in-memory dropdown catalog จาก STG
-- **Prerequisites:** model อย่างน้อยหนึ่งไฟล์; SQL connection เมื่อโมเดลต้องใช้ cascade fields
-- **Command:** `.venv/bin/python -m streamlit run app_used_car.py`
-- **Arguments:** ไม่มี application argparse; ใช้ Streamlit CLI
-- **Process:** เลือก model → load frozen schema → query `TOP (0)` และ `SELECT DISTINCT PCS_DATE, brand, model, sub_model` → render form → shared predictor
-- **Output:** แสดงราคา/negative warning/category mapping และ CSV downloadใน browser
-- **Side effects:** อ่าน DB และ model; catalog cacheใน memory; ไม่เขียน catalog CSVและไม่ retrain
-- **Common errors:** model ไม่พบ, catalog columns หาย, DB connection, snapshot dropdownต่างจาก model, numeric inputไม่ถูกต้อง
+**ทำอะไร:** เปิด Streamlit UI เพื่อเลือก saved model, กรอกข้อมูล และ predict รถทีละคัน พร้อม dropdown catalog จาก STG
+
+**ควรรันเมื่อไร:** เมื่อต้องการใช้งานผ่าน browser ไม่ต้องรันสำหรับ batch CSV
+
+**ต้องเตรียม:** trusted joblib, Streamlit dependencies และ SQL connection สำหรับ dropdown catalog
+
+**COPY-PASTE COMMAND:**
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+read -rs "USED_CAR_DB_PASSWORD?SQL Server password: "
+echo
+export USED_CAR_DB_PASSWORD
+.venv/bin/python -m streamlit run app_used_car.py
+```
+
+**ตัวอย่างเพิ่มเติม — จำกัดให้เปิดจากเครื่องนี้:**
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+.venv/bin/python -m streamlit run app_used_car.py --server.address 127.0.0.1
+```
+
+**ระหว่าง Run:** ค้น/โหลด model, query `TOP (0)` และ `SELECT DISTINCT PCS_DATE, brand, model, sub_model`, cache catalog ใน memory และใช้ predictor ร่วม
+
+**เมื่อสำเร็จ:** Terminal แสดง local URL; browser แสดงราคา/warnings และดาวน์โหลด CSV ได้ ไม่มี catalog CSV บน disk
+
+**ขั้นตอนต่อไป:** หยุดด้วย `Ctrl+C` แล้ว `unset USED_CAR_DB_PASSWORD`
+
+**ข้อควรระวัง:** UI ไม่ retrain; catalog snapshot อาจต่างจาก training PCS_DATE; DB query อ่าน distinct values จาก STG
 
 ### 4.4 [`analyze_used_car_ols.py`](analyze_used_car_ols.py)
 
-- **ใช้เมื่อ:** ต้องการ in-sample error diagnostics ของ complete run
-- **Input:** RESULT, COEFFICIENT, Rank-1 joblib และ matching current STG snapshot
-- **Prerequisites:** DB connectionและ artifactsสามไฟล์ตรงกัน
-- **Command:** `.venv/bin/python analyze_used_car_ols.py`
-- **Arguments:** ไม่มี argparse; `RUN_ID` เป็นค่าคงที่ใน source ปัจจุบัน (`20260920_011528`) หรือแก้เป็น `None` เพื่อเลือก latest complete run
-- **Process:** load artifacts → อ่าน STG → บังคับ PCS_DATE ตรง model → predict in-sample → แยก price band, errors, negative และ OTHER
-- **Output:** `00_overview_…` ถึง `06_all_in_sample_predictions_…` ใต้ `output/analysis/<PCS_DATE>/`
-- **Side effects:** อ่าน DB/joblib และเขียน row-level CSV; ไม่ retrain
-- **ข้อควรระวัง:** เป็น in-sample diagnostics และ `clean_target()` เก็บ positive pricesทั้งหมด จึงไม่ใช่ V4 OOF/Holdout report และอาจไม่ตรง eligible cohort `price > 1,000`
+**ทำอะไร:** นำ full-data-fitted model กลับมาทำนาย matching STG snapshot เพื่อสร้าง in-sample diagnostics
+
+**ควรรันเมื่อไร:** เมื่อต้องการตรวจ price bands, errors, negative predictions และ `__OTHER__`; ไม่ต้องรันเพื่ออ่าน V4 CV/Holdout reports
+
+**ต้องเตรียม:** SQL connection, STG snapshot `20260918` และ artifacts ครบของ hardcoded Run `20260920_011528`
+
+**COPY-PASTE COMMAND:**
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+read -rs "USED_CAR_DB_PASSWORD?SQL Server password: "
+echo
+export USED_CAR_DB_PASSWORD
+.venv/bin/python analyze_used_car_ols.py
+```
+
+**ตัวอย่าง Run อื่น:** ไม่มี CLI flag ปัจจุบัน หากต้องการ `20260920_222201` ต้องแก้ constant `RUN_ID` ใน source และ review ก่อน งานเอกสารนี้ไม่ได้แก้ source และคำสั่งข้างต้นไม่เลือก run ใหม่นั้นอัตโนมัติ
+
+**ระหว่าง Run:** validate RESULT/COEFFICIENT/joblib, อ่าน STG, ตรวจ PCS_DATE, predict in-sample และแยกรายงาน
+
+**เมื่อสำเร็จ:** ได้ `00_overview_20260920_011528.csv` ถึง `06_all_in_sample_predictions_20260920_011528.csv` ใน `output/analysis/20260918/`; ตรวจ `[DONE]` และ `[WARNING]`
+
+**ขั้นตอนต่อไป:** เปิด overview ก่อน แล้วค่อยตรวจ error/negative/OTHER; จากนั้น unset Password
+
+**ข้อควรระวัง:** ไม่ใช่ Holdout หรือ OOF; `clean_target()` เก็บ positive prices ไม่ได้จำกัด V4 eligible `price > 1,000`; output มี row-level dataและอาจเขียนทับ; snapshot mismatch จะหยุด
 
 ### 4.5 [`plot_used_car_ols.py`](plot_used_car_ols.py)
 
-- **ใช้เมื่อ:** สร้างกราฟของ complete run
-- **Input:** artifactsสามไฟล์และ matching STG snapshot
-- **Prerequisites:** DB/model/CSV; `RUN_ID=None` เลือก latest complete run
-- **Command:** `.venv/bin/python plot_used_car_ols.py`
-- **Arguments:** ไม่มี argparse; เลือก runโดยแก้ค่าคงที่ `RUN_ID`
-- **Process:** validate artifacts → in-sample prediction → สร้าง actual/predicted, residual, model comparison, distribution และ coefficient CI
-- **Output:** PNG 5 ไฟล์ใต้ `output/graphs/<PCS_DATE>/`
-- **Side effects:** อ่าน DB/joblib/CSV และเขียน PNG; ชื่อเดิมถูกเขียนทับได้
-- **ข้อควรระวัง:** กราฟสามชนิดเป็น in-sample ข้อความบางจุดใน scriptยังเรียก CSV metric ว่า mean 5-fold แต่ Training V4 export `RMSE/MAE` เป็น pooled Development OOF ให้ยึด V4 metadata เป็นหลัก
+**ทำอะไร:** สร้าง PNG actual-vs-predicted, residual, model comparison, distribution และ coefficient CI
+
+**ควรรันเมื่อไร:** เมื่อต้องการกราฟ diagnostics ของ complete run ไม่ต้องรันเพื่อ Predict รถใหม่
+
+**ต้องเตรียม:** SQL connection, matching STG snapshot และ RESULT/COEFFICIENT/joblib ครบชุด
+
+**COPY-PASTE COMMAND:**
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+read -rs "USED_CAR_DB_PASSWORD?SQL Server password: "
+echo
+export USED_CAR_DB_PASSWORD
+.venv/bin/python plot_used_car_ols.py
+```
+
+**ตัวอย่างเลือก Run:** source ไม่มี argparse; `RUN_ID=None` ค้น complete runs ทุก date folder แล้วเลือก RUN_ID timestamp ล่าสุด หากต้องการล็อก run ต้องแก้ constant ใน sourceและ review ก่อน
+
+**ระหว่าง Run:** validate artifacts, อ่าน STG, บังคับ snapshot date ให้ตรง model, predict in-sample และ render กราฟ
+
+**เมื่อสำเร็จ:** ได้ `01_actual_vs_predicted_RUN_ID.png` ถึง `05_coefficient_confidence_interval_RUN_ID.png` ใน `output/graphs/20260918/` เมื่อ model/STG ใช้ snapshot นี้; ตรวจ `[SAVED]` ครบห้าบรรทัด
+
+**ขั้นตอนต่อไป:** เปิด PNG และอ่านว่า metric มาจาก in-sample, CV หรือ fitted coefficients แล้ว unset Password
+
+**ข้อควรระวัง:** PNG ชื่อเดิมเขียนทับได้; actual/residual/distribution เป็น in-sample; source annotation ยังกล่าวว่า mean 5-fold แต่ V4 RESULT RMSE/MAE คือ pooled Development OOF
 
 ### 4.6 [`scripts/review_stg_schema.py`](scripts/review_stg_schema.py)
 
-- **ใช้เมื่อ:** ต้องการ Actual Schema metadata โดยไม่อ่านข้อมูลรถ
-- **Input:** DB environment; queryเฉพาะ `INFORMATION_SCHEMA.COLUMNS`
-- **Prerequisites:** SQL connection; ควรเรียกผ่าน shell wrapper
-- **Command:** `./scripts/run_schema_review.sh`
-- **Arguments:** `--output <PATH>` optional
-- **Process:** static read-only SQL guard → metadata query → fingerprint
-- **Output:** `output/analysis/schema_review/actual_schema_<TIMESTAMP>.json`
-- **Side effects:** อ่าน metadataและเขียน JSON; refuse overwrite; ไม่มี table-row SELECT/DDL/DML
+**ทำอะไร:** อ่านเฉพาะ column name, SQL type, nullable และ ordinal จาก `INFORMATION_SCHEMA.COLUMNS` แล้วสร้าง metadata JSON/fingerprint
+
+**ควรรันเมื่อไร:** ก่อน Registry review/Training เมื่อ STG schema อาจเปลี่ยน ไม่ต้องรันเพื่อ Predict
+
+**ต้องเตรียม:** SQL connection metadata permission; wrapper รับ Password แบบ hidden prompt
+
+**COPY-PASTE COMMAND — ผ่าน wrapper:**
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+./scripts/run_schema_review.sh --output "output/analysis/schema_review/actual_schema_manual_$(date '+%Y%m%d_%H%M%S').json"
+```
+
+**ตัวอย่าง Python โดยตรง:**
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+read -rs "USED_CAR_DB_PASSWORD?SQL Server password: "
+echo
+export USED_CAR_DB_PASSWORD
+.venv/bin/python scripts/review_stg_schema.py \
+  --output "output/analysis/schema_review/actual_schema_direct_$(date '+%Y%m%d_%H%M%S').json"
+unset USED_CAR_DB_PASSWORD
+```
+
+**ระหว่าง Run:** static guard ยืนยัน query scope, query metadata, normalize rows และคำนวณ fingerprint
+
+**เมื่อสำเร็จ:** Terminal แสดง path/count; เปิด JSON ตรวจ `report_type`, scope, count และ `columns`
+
+**ขั้นตอนต่อไป:** ส่ง report เข้า `validate_schema_registry.py`
+
+**ข้อควรระวัง:** ไม่มี row-data SELECT/DDL/DML; ปฏิเสธ output เดิม; metadata ควรผ่าน review ก่อน share
 
 ### 4.7 [`scripts/validate_schema_registry.py`](scripts/validate_schema_registry.py)
 
-- **ใช้เมื่อ:** เทียบ local schema report กับ Registry โดย offline
-- **Input:** report JSON และ Registry JSON
-- **Prerequisites:** reportจาก schema reviewer
-- **Command:** `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python scripts/validate_schema_registry.py <REPORT>`
-- **Arguments:** positional `report`, optional `--registry <PATH>`
-- **Process:** ตรวจ scope/count/fingerprint/ordinal → map SQL type family → New/Missing/type compatibility/authorization
-- **Output:** JSON summaryบน terminal; exit `0` เมื่อ valid, `1` เมื่อพบ issues
-- **Side effects:** อ่าน local JSON เท่านั้น ไม่เขียนไฟล์และไม่เชื่อม DB
+**ทำอะไร:** เปรียบเทียบ local schema metadata report กับ Feature Approval Registry แบบ offline
+
+**ควรรันเมื่อไร:** หลัง Schema Review และก่อน Training ไม่ต้องรันเพื่อ Prediction
+
+**ต้องเตรียม:** report จริงและ `config/feature_approval_registry.json`
+
+**COPY-PASTE COMMAND:**
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python scripts/validate_schema_registry.py \
+  output/analysis/schema_review/actual_schema_20260920_130140.json
+```
+
+**ตัวอย่างระบุ Registry ชัดเจน:**
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python scripts/validate_schema_registry.py \
+  output/analysis/schema_review/actual_schema_20260920_130140.json \
+  --registry config/feature_approval_registry.json
+```
+
+**ระหว่าง Run:** ตรวจ type/scope/count/fingerprint/ordinals, New/Missing/type compatibility และ authorization
+
+**เมื่อสำเร็จ:** JSON summary บน Terminal; exit `0` เมื่อ valid และ `1` เมื่อพบ issue ตรวจ `valid`, `issues`, `new_columns`, `missing_columns`
+
+**ขั้นตอนต่อไป:** ถ้า valid ให้เสนอ Training approval; ถ้ามี issue ให้ผ่าน owner review ไม่แก้ STG
+
+**ข้อควรระวัง:** ไม่เชื่อม SQL Serverและไม่เปลี่ยน Registry/approval; ห้ามใช้ historical CSV header แทน Actual Schema
 
 ### 4.8 [`tests/test_training_evaluation_v4.py`](tests/test_training_evaluation_v4.py)
 
-- **ใช้เมื่อ:** หลังแก้ Training V4, Registry Gate, output contracts หรือก่อนเสนอ Commit
-- **Command:** `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest discover -s tests -v`
-- **Process:** synthetic testsสำหรับ cohort, leakage-safe split/CV, preprocessing, ranking, holdout/refit, bundle, schema drift, Registry และ offline validator
-- **Output:** test resultบน terminal ไม่มี training artifacts
-- **Side effects:** ใช้ temporary directories; ไม่ต่อ DBและไม่ใช้ข้อมูลรถจริง
-- **สถานะล่าสุดใน Work Log:** 36 testsผ่าน ณ Initial Owner Approval validation
+**ทำอะไร:** synthetic unittest สำหรับ eligible cohort, split/CV, preprocessing, ranking, Holdout/refit, bundle, dynamic schema และ approval gate
+
+**ควรรันเมื่อไร:** หลังแก้ logic ที่เกี่ยวข้องหรือก่อนเสนอ Commit ไม่ต้องรันเพื่อสร้าง model
+
+**ต้องเตรียม:** `.venv` และ project source; ไม่ต้องมี DB/model production/input CSV
+
+**COPY-PASTE COMMAND — module นี้:**
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest tests.test_training_evaluation_v4 -v
+```
+
+**ตัวอย่าง discover suite:**
+
+```bash
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest discover -s tests -v
+```
+
+**ระหว่าง Run:** สร้าง synthetic DataFrames/temp directories และเรียกหน่วย logic โดยไม่เข้า training `main()`
+
+**เมื่อสำเร็จ:** Terminal แสดง tests เป็น `ok` และสรุป `OK`; ไม่มี training artifacts
+
+**ขั้นตอนต่อไป:** บันทึกจำนวน/ผลจริงใน Work Log เมื่อเป็นรอบ implementation
+
+**ข้อควรระวัง:** ไม่ใช่ Training และไม่ยืนยัน SQL/ODBC/runtime performance; Work Log บันทึกล่าสุด 36 tests ผ่าน แต่งานเอกสารนี้ไม่ได้ rerun tests
 
 <a id="shell-scripts"></a>
 ## 5. Shell Scripts และ Runners
 
 ### [`scripts/run_schema_review.sh`](scripts/run_schema_review.sh)
 
-Wrapper นี้ปิด shell tracing, ถาม Passwordด้วย hidden prompt, exportให้ child process แล้วเรียก `review_stg_schema.py` หน้าที่ของมันคือ Schema Metadata Review ไม่ใช่ Training
+Wrapper นี้ปิด shell tracing, ถาม Password แบบ hidden prompt, export ให้ child process แล้วเรียก `scripts/review_stg_schema.py`
 
 ```bash
-./scripts/run_schema_review.sh
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+./scripts/run_schema_review.sh --output "output/analysis/schema_review/actual_schema_manual_$(date '+%Y%m%d_%H%M%S').json"
 ```
+
+ต้องใช้ SQL Server แต่ไม่อ่าน row data; หลังเสร็จให้ validate report แบบ offline
 
 ### [`scripts/run_training_v4.sh`](scripts/run_training_v4.sh)
 
-Runner นี้เริ่ม **Training จริง** สร้าง RUN_ID, ใช้ `tee` ให้เห็น outputพร้อมเขียน `logs/train_<RUN_ID>.log`, รักษา Python exit statusด้วย `pipefail`, scan logหา credential pattern และตรวจ RESULT/COEFFICIENT/joblibว่ามี exactly oneชุดสำหรับ RUN_ID
-
-Runner ไม่ถาม Password ต้องกำหนด environmentก่อน และจะ refuse overwrite logเดิม:
+Runner นี้เรียก `train_used_car_ols.py` เพื่อเริ่ม Training จริง สร้าง RUN_ID, ใช้ `tee` แสดง/บันทึก `logs/train_RUN_ID.log`, scan credential patterns และตรวจ RESULT/COEFFICIENT/joblib ว่ามีหนึ่งชุดตรง RUN_ID
 
 ```bash
-IFS= read -r -s -p "SQL Server password: " USED_CAR_DB_PASSWORD; echo
+cd /Users/krissanap/Document/KMUTT/USECAR_PREDICT_PRICE
+read -rs "USED_CAR_DB_PASSWORD?SQL Server password: "
+echo
 export USED_CAR_DB_PASSWORD
 ./scripts/run_training_v4.sh
 unset USED_CAR_DB_PASSWORD
 ```
 
-อย่ารันเพื่อตรวจ Schemaหรือ dry run และต้องได้รับ Owner Approval สำหรับ Controlled Training ก่อน
+Runner ไม่ถาม Passwordและไม่ใช่ dry run ปกติให้ runner สร้าง timestamp เพื่อลด collision; ต้องได้รับ Training approval ก่อน
+
 
 <a id="feature-approval"></a>
 ## 6. Feature Approval และ Dynamic Schema
@@ -406,51 +786,7 @@ Development OOF metricsใช้เลือกโมเดล Holdout metrics�
 <a id="prediction-guide"></a>
 ## 9. Prediction Guide
 
-### เลือก Model และดู Input Contract
-
-ไม่ส่ง `--run-id` จะเลือก runที่ชื่อใหม่สุด การระบุ RUN_IDชัดเจนปลอดภัยกว่า:
-
-```bash
-.venv/bin/python predict_used_car_ols.py --run-id <RUN_ID> --show-features
-```
-
-สร้าง template:
-
-```bash
-.venv/bin/python predict_used_car_ols.py --run-id <RUN_ID> \
-  --write-template --output-csv input/cars_<RUN_ID>.csv
-```
-
-### รถหนึ่งคัน
-
-ตัวอย่าง Toyota CAMRY ต่อไปนี้เป็นข้อมูลสมมติ ไม่รับประกันราคาตลาด ต้องส่งเฉพาะ featureที่ `--show-features` ระบุ:
-
-```bash
-.venv/bin/python predict_used_car_ols.py --run-id <RUN_ID> \
-  --feature brand=Toyota \
-  --feature model=CAMRY \
-  --feature model_year=2020 \
-  --feature mileage=60000 \
-  --output-csv output/predict/manual/toyota_camry.csv
-```
-
-หาก saved modelต้องใช้ featureอื่น ต้องเพิ่มให้ครบ หาก modelไม่ได้ใช้ featureใด ห้ามส่ง featureนั้นใน direct mode
-
-JSON mode:
-
-```bash
-.venv/bin/python predict_used_car_ols.py --run-id <RUN_ID> \
-  --car-json '{"brand":"Toyota","model":"CAMRY","model_year":2020,"mileage":60000}' \
-  --output-csv output/predict/manual/toyota_camry_json.csv
-```
-
-### หลายคันจาก CSV
-
-```bash
-.venv/bin/python predict_used_car_ols.py --run-id <RUN_ID> \
-  --input-csv input/cars_<RUN_ID>.csv \
-  --output-csv output/predict/manual/batch_<RUN_ID>.csv
-```
+คำสั่งเต็มสำหรับ `--show-features`, CLI 11 inputs, JSON 11 inputs, template และ batch CSV อยู่ในหัวข้อ [`predict_used_car_ols.py`](#predict-python-runbook) และใน [Quick Commands](#quick-start) โดยใช้ Run `20260920_222201` กับ PCS_DATE `20260918` ทุกตัวอย่าง คำสั่งเหล่านั้นกำหนด output filename ใหม่เพื่อลดการเขียนทับผลเดิม
 
 ### Category Encoding และผลลัพธ์
 
@@ -458,16 +794,13 @@ JSON mode:
 - `Camry` และ `CAMRY` อาจไม่ใช่ levelเดียวกัน
 - unseen/rare categoryถูก mapเป็น `__OTHER__`; missing text normalizeเป็น `__MISSING__` ก่อน mapping
 - numeric missing/แปลงไม่ได้ใช้ training medianตาม saved preprocessor
-- ส่งเฉพาะ schemaของ saved model ไม่ใช่ Approved 11ทั้งหมด
+- ส่งเฉพาะ schemaของ saved model การที่ Registry อนุมัติ 11 features ไม่ได้บังคับให้ทุก model ใช้ครบ 11
 - `PREDICTED_PRICE_THB`: OLS point prediction
 - `NEGATIVE_PREDICTION`: `True` เมื่อผลต่ำกว่า 0; ระบบไม่ clamp
 - `<feature>_MODEL_CATEGORY`: categoryจริงที่ encoderใช้ ช่วยตรวจ `__OTHER__`
 
-เปิด UI:
-
-```bash
-.venv/bin/python -m streamlit run app_used_car.py
-```
+- Prediction CLI ใช้ joblib และไม่ต่อ SQL Server
+- Streamlit ใช้ joblib เช่นกัน แต่ implementation ปัจจุบันต่อ SQL Server เพื่อสร้าง dropdown catalog
 
 <a id="evaluation-limitations"></a>
 ## 10. Model Evaluation และข้อจำกัด

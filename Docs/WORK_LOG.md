@@ -465,3 +465,12 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python scripts/validate_schema_registry.py \
 - ระบุข้อเท็จจริงสำคัญ: ไม่มี dependency manifest/lockfile, analyze/plotใช้ in-sample snapshot diagnostics, Plotมีข้อความ historical mean-foldที่ไม่ตรง pooled OOF semanticsของ Training V4 และ default prediction pathอาจเขียนทับผล runเดิมหากไม่กำหนด `--output-csv`
 - ตรวจ Python/Shell inventory, relative links/explicit anchors, code fences/Mermaid, RESULT 18/COEFFICIENT 13 columns, secret patterns, `git diff --check` และ Git status
 - แก้เฉพาะ `README.md` และ sectionนี้ใน `Docs/WORK_LOG.md`; ไม่แก้ Python, Shell, Registry, Data Dictionary, Databaseหรือ artifacts และไม่ Commit/Push
+
+## 2026-09-20 — ปรับ README เป็น Copy-paste Runbook
+
+- ปรับหัวข้อ Quick Commands ตาม workflow 12 ขั้น และคู่มือ Python ทั้ง 8 ไฟล์ให้มี prerequisites, คำสั่งที่เริ่มจาก Project Root, process, output/วิธีตรวจ, ขั้นต่อไป และข้อควรระวังครบในหัวข้อของไฟล์
+- ใช้ตัวอย่าง Model Run `20260920_222201`, Training PCS_DATE `20260918` และ Actual Schema Report `output/analysis/schema_review/actual_schema_20260920_130140.json`; ตัวอย่าง Predict CLI/JSON/CSV มี 11 inputs และกำหนด output filename แยก
+- ยืนยันจาก source ว่า `analyze_used_car_ols.py` hardcode `RUN_ID="20260920_011528"`, `plot_used_car_ols.py` ใช้ `RUN_ID=None` เพื่อเลือก latest complete run และ Prediction CLI ไม่ใช้ SQL Server
+- Static checks ผ่าน: พบ Python 8/8 ไฟล์ใน README, bash blocks 33 ชุดไม่มี placeholderต้องแทนค่า, direct Predict example มี 11 inputs ครบ, local links/explicit anchors/fences/example artifact paths/secret patterns และ `git diff --check` ไม่พบปัญหา
+- งานนี้ตรวจเอกสาร/source แบบ static เท่านั้น ไม่รัน Training, Predict, Analysis, Plot, SQL, Streamlit หรือ automated tests และไม่แก้ Python/Shell/Registry/Database/Data Dictionary
+- ไฟล์ที่แก้มีเฉพาะ `README.md` และ `Docs/WORK_LOG.md`; ไม่ Commit/Push รอ Owner review
