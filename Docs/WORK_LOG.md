@@ -236,3 +236,92 @@ Acceptance ทั้งหมดต้องผ่านก่อนเสนอ
 ### Handoff สำหรับ ChatGPT
 
 อ่าน `AGENTS.md`, `Docs/PROJECT_CONTEXT.md`, section “2026-09-20 — แผน Training Evaluation V4” ในไฟล์นี้ และ source `train_used_car_ols.py` ล่าสุดก่อนทำงาน Application ยังไม่ถูกแก้และยังไม่มี V4 train run สิ่งที่ต้องให้เจ้าของโครงการตัดสินใจคือ 10 ข้อในหัวข้อ E โดยเฉพาะ split/duplicate policy, Rank-1-only Holdout, coefficient-only full refit, metric semantics และ raw log/artifact Git policy รักษา dirty `.DS_Store` กับ untracked run `092442` ไว้ ห้าม Commit/Push หรือเปิดเผย credential
+
+## 2026-09-20 — Training Evaluation V4 Implementation
+
+### Baseline และขอบเขต
+
+- เริ่มจาก clean `master` ที่ `75f1ea6b2bd3c8ac80de48529c040b101abad144`; local `HEAD`, `origin/master` และ live GitHub `master` ตรงกันทั้งตอนเริ่มและ final verification
+- ได้รับอนุมัติ Implementation, synthetic automated tests, additive sidecars, RUN_ID/log wrapper, `.gitignore` และเอกสาร
+- ไม่ได้รับอนุมัติ Full Training กับ SQL Server, Commit หรือ Push จึงไม่ได้ทำสามรายการนี้
+- ไม่แก้ Database Schema, `STG_USED_CAR`, Data Dictionary, Predict Logic หรือ Streamlit UI behavior
+
+### Agent coordination
+
+| Agent | สิทธิ์ | สถานะ/ผล |
+| --- | --- | --- |
+| Main Agent | แก้ Training/integration/new support files/docs | Implementation และ integration checks เสร็จ |
+| Agent 1 — Training Audit | Read-only | ตรวจ flow/leakage/group split/ranking/holdout/refit/output/RUN_ID และส่ง edge casesครบ ไม่มีการแก้ไฟล์ |
+| Agent 2 — Testing & Evaluation | แก้ `tests/` เท่านั้น | สร้าง synthetic test suite; ผลล่าสุดบันทึกด้านล่าง |
+| Agent 3 — Compatibility & Security | Read-only | ยืนยัน additive bundle compatibility, 18/13 schema, no target gate และระบุ diagnostics/security risks ไม่มีการแก้ไฟล์ |
+
+### Implementation ที่เปลี่ยน
+
+- เพิ่ม permanent eligible cohort `price > 1,000` หลัง `clean_target()` และใช้ cohortเดียวสำหรับ Development/CV/Holdout/Refit Outlier flagsยังเป็น review-only
+- เพิ่ม transitive duplicate groupingจาก normalized listing ID/URL โดยสร้าง groupก่อนตัด cohortเพื่อรักษา identity bridge, deterministic group-safe splitที่ใกล้ 20% ที่สุดภายใน tolerance ±5 percentage points และ fixed business price-band metadata
+- เพิ่ม common group-safe 5 folds; preprocessing/type/eligibility/category/feature selectionเรียนจาก fold train Validation transform/predictเท่านั้น
+- เปลี่ยน CV เป็น pooled OOF RMSE/MAE และ ranking `RMSE → MAE → candidate_id`; เพิ่ม fold mean/std, price-band, negative และ model OTHER diagnostics
+- Fit Top 3 Development checkpointsก่อนเปิด Holdout ประเมิน Holdoutเฉพาะ Rank 1 แล้วทำ coefficient-only refitบน Eligible Full Dataด้วย frozen design
+- RESULT/COEFFICIENT schemasเดิม; `N_OBSERVATION` จาก `ols_result.nobs`; bundle 2.0 เพิ่ม V4 metadataแบบ additiveและคง Predictor required keys
+- เพิ่ม evaluation/holdout/metadata sidecarsใต้ `output/analysis/YYYYMMDD/` แยก metric stagesชัดเจน และเก็บ Development OOF diagnosticsของทุก successful candidate
+- เพิ่ม strict optional `USED_CAR_RUN_ID`, collision refusalก่อน outputแรก และไม่พิมพ์ DB endpoint/password/connection stringใน normal config output
+- เอา nonempty password defaultออกจาก current source; environmentต้องให้ `USED_CAR_DB_PASSWORD` ตอน controlled run
+- เพิ่ม `scripts/run_training_v4.sh` สำหรับ `pipefail`, terminal+logผ่าน `tee`, RUN_ID/artifact verificationและ credential-pattern scan
+- เพิ่ม root `.gitignore`; ไม่ untrack, delete หรือ rewrite tracked files/historyเดิม
+
+### Additional Requirement — Dynamic Source Schema
+
+- ตรวจยืนยันว่า `load_source_data()` ใช้ `SELECT *` และไม่มี snapshot-specific feature list; `infer_candidate_universe()` อ่านเฉพาะ Development schema ส่วน missing/cardinality/numeric-like/category eligibility เรียนใหม่ใน fold trainผ่าน `infer_eligible_features()`/`fit_preprocessor()` จึงไม่ใช้ Holdoutกำหนด eligibilityหรือ datatype
+- คง optional schema behavior: คอลัมน์เพิ่ม/ลบ/เปลี่ยนชื่อถือเป็น current-run schemaและเข้า exclusion/eligibility/candidate generationตามกฎเดิม ไม่มีการ hardcode snapshotปัจจุบัน
+- กำหนด mandatory source columnsชัดเจนเป็น `price` และ `PCS_DATE`; normalizeชื่อแบบ case-insensitiveและ failก่อน trainingหากขาดหรือมีชื่อซ้ำแบบ case-insensitiveที่กำกวม
+- เพิ่ม additive `training_feature_schema` ใน Rank-1 bundle พร้อมคง `selected_source_features` และ frozen preprocessorเดิม Predictorจึงใช้ feature schemaตอน train, เพิกเฉย extra input columns และ rejectเมื่อ selected featureหายไป
+- ไม่มีการแก้ `STG_USED_CAR`, Database Schema, Predictor logic หรือ Output Schemaหลัก
+
+### ไฟล์ที่แก้/สร้าง
+
+- Modified: `train_used_car_ols.py`
+- New: `.gitignore`
+- New: `scripts/run_training_v4.sh`
+- New: `tests/test_training_evaluation_v4.py`
+- Modified: `Docs/PROJECT_CONTEXT.md`
+- Modified: `Docs/WORK_LOG.md`
+- ไม่แก้: `predict_used_car_ols.py`, `app_used_car.py`, `analyze_used_car_ols.py`, `plot_used_car_ols.py`, Data Dictionary และ source/artifacts
+
+### Automated tests และ checks
+
+- PASSED: `.venv/bin/python -m unittest discover -s tests -v` — 11/11 synthetic tests ณ integration passแรก
+- PASSED: Python AST parse ทั้ง 5 application scriptsและ test file
+- PASSED: `bash -n scripts/run_training_v4.sh`
+- PASSED: `git diff --check`
+- PASSED: no DB/training/artifact write/joblib deserializationใน tests
+- PASSED: tracked pycacheที่ test importทำให้เปลี่ยนถูกคืนเป็น HEAD; ไม่รวม generated bytecodeใน intended diff
+- PASSED final rerun: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest discover -s tests -v` — 25/25 tests ครอบคลุม exact schema order, RUN_ID/collision, legacy bundle contract, duplicate bridgeผ่าน ineligible row, unseen→`__OTHER__`, holdout tolerance, categorical numeric-like coercion และ dynamic schema cases
+- PASSED dynamic-schema regression: optional columnเพิ่ม/ลบ/เปลี่ยนชื่อ, numeric↔numeric-like string datatype, mandatory `price`/`PCS_DATE` หาย, case-insensitive duplicate mandatory name, extra prediction column และ missing saved model feature
+- PASSED: synthetic end-to-end V4 integrationใน temporary directory — Development/Holdout 80/20, common OOF coverage, Rank checkpoint, Holdout evaluation, frozen Full-data refit `nobs=100`, RESULT/COEFFICIENT/bundle และ sidecar exportsครบ; statsmodelsออก covariance-rank warningsจาก synthetic collinearityแต่ไม่มี test failure
+- PASSED: prior credential literalไม่อยู่ใน changed text/current source defaultว่าง โดยตรวจแบบไม่แสดงค่า
+- PASSED: final intended Git statusมีเฉพาะ Training, tests, support files และ docsที่ระบุ ไม่มี pycache/artifact/logใหม่
+
+### ข้อจำกัดและสิ่งที่ยังไม่ได้ทดสอบ
+
+- NOT TESTED: SQL Server connectivity, actual current snapshot, ODBC/runtime, full candidate runtime/memory และตัวเลข metrics V4จริง
+- NOT TESTED: การสร้าง artifacts/sidecars/logจริงจาก end-to-end controlled run และ collisionกับไฟล์จริง
+- NOT TESTED: Streamlit DB catalog/rendering; Predictor compatibilityตรวจด้วย synthetic bundle ไม่ใช่ production joblib
+- NOT IMPLEMENTED ในรอบ core V4: ปรับ `analyze_used_car_ols.py`/`plot_used_car_ols.py` ให้อ่าน sidecarsและเปลี่ยน historical in-sample/mean-fold labels เพราะ approved agent reviewเป็น read-onlyและ main phaseจำกัด Training/new files เอกสาร V4กำกับความหมายไว้แล้ว ควรทำ phaseถัดไปก่อนใช้ diagnosticsกับ V4 run
+- SECURITY LIMITATION: current sourceไม่มี hardcoded default แต่ secretใน Git history/tracked bytecodeเดิมยังอยู่ การ rotate/untrack/history cleanupยังต้องขออนุมัติแยก
+- DATA LIMITATION: duplicate policyตรวจ exact normalized listing ID/URL; รถคันเดิมที่ถูก relistด้วย identityใหม่ยังอาจข้าม splitได้
+- STATISTICAL LIMITATION: Holdoutวัด Development checkpoint ไม่ใช่ exported Full-data refit modelตามที่ metadataระบุ; Holdoutห้ามใช้ปรับ modelหลังดูผล
+- OPERATIONAL LIMITATION: principal outputsและ sidecarsยังเขียนทีละไฟล์ ไม่ใช่ atomic transaction หาก controlled runหยุดกลางทางต้องเก็บหลักฐาน, ไม่ใช้ partial artifacts และเริ่มใหม่ด้วย RUN_ID ใหม่
+
+### Controlled training command — ยังไม่รัน
+
+เมื่อเจ้าของอนุมัติและตั้ง DB environmentครบ ให้รันจาก project root:
+
+```bash
+USED_CAR_RUN_ID="$(date '+%Y%m%d_%H%M%S')" ./scripts/run_training_v4.sh
+```
+
+Scriptใช้ RUN_IDเดียวกับ `logs/train_<RUN_ID>.log` และ artifacts ตรวจไม่ overwrite, รักษา Python exit status และตรวจชื่อไฟล์หลังจบ Raw logถูก `.gitignore` และต้องตรวจ secret/row-level contentก่อนแชร์เสมอ
+
+### สถานะการส่งมอบ
+
+Implementation และ synthetic validationเสร็จ แต่สถานะยังเป็น **awaiting owner approval for controlled V4 training run** ห้าม Commit/Pushจนได้รับอนุมัติ

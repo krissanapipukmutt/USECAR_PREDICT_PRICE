@@ -1,6 +1,28 @@
 # USECAR_PREDICT_PRICE — Project Context
 
-ตรวจจาก Workspace วันที่ **2026-09-20 (Asia/Bangkok)** ที่ commit `3bd4cadb55280535d56999ddeb5503fcd4291084` เอกสารนี้อธิบายพฤติกรรมที่ตรวจพบ ไม่ใช่การอนุมัติเปลี่ยนโมเดลหรือ Schema
+ตรวจจาก Workspace วันที่ **2026-09-20 (Asia/Bangkok)** โดย V4 เริ่มจาก baseline commit `75f1ea6b2bd3c8ac80de48529c040b101abad144` เอกสารนี้อธิบายพฤติกรรมที่ตรวจพบ ไม่ใช่การอนุมัติเปลี่ยนโมเดลหรือ Schema
+
+## Training Evaluation V4 — implemented, awaiting controlled training
+
+Implementation V4 ถูกเพิ่มบน Git baseline `75f1ea6b2bd3c8ac80de48529c040b101abad144` และผ่าน automated synthetic tests แล้ว แต่ **ยังไม่ได้รัน Training กับ SQL Server** หัวข้อเก่าด้านล่างยังมีประโยชน์ในฐานะ pre-V4/historical artifact context; หากกล่าวถึง BASELINE/EXPERIMENT, all-positive validation หรือ mean-fold ranking ให้ถือว่าถูกแทนด้วย behavior V4 ต่อไปนี้สำหรับ code ปัจจุบัน:
+
+- `clean_target()` ยังตรวจ numeric/finite/positive ก่อน แล้ว `select_eligible_cohort()` กำหนด cohort ถาวร `price > 1,000` สำหรับ Development, CV, Holdout และ Full-data Refit เท่านั้น Predictor/UI ไม่มี target gate
+- `build_duplicate_groups()` รวมความสัมพันธ์ `listing_id` หรือ `source_url` แบบ transitiveบน positive-price snapshot ก่อนตัด cohort เพื่อไม่ให้แถวราคา ≤1,000 ที่เชื่อม identity ทำให้ duplicate หลุดข้าม partition; missing identity เป็น singleton `split_development_holdout()` เลือก group-safe split ที่ใกล้ 20% ที่สุดด้วย seed 42 และยอมคลาดเคลื่อนไม่เกิน ±5 percentage points
+- `build_common_cv_folds()` สร้าง common 5 folds ครั้งเดียวบน Eligible Development และห้าม group ข้าม fold ทุก candidate รับ fold indices ชุดเดียวกัน
+- Numeric-like decision, missing/cardinality eligibility, medians, category levels/reference/OTHER และ backward feature selection เรียนจาก fold train เท่านั้น `evaluate_candidate_cv()` สร้าง OOF predictionครบหนึ่งครั้งต่อ Development row
+- `rank_candidates()` ใช้ pooled Development OOF RMSE → pooled OOF MAE → Candidate ID ไม่มี Holdout หรือ adjusted R² ใน ranking
+- Top 3 Development checkpoints ถูกเลือกก่อนเปิด Holdout; `evaluate_frozen_candidate()` ประเมิน Holdout เฉพาะ Rank 1 ครั้งเดียว
+- `refit_candidate_coefficients()` ใช้ frozen Development preprocessor/selected structure กับ Eligible Full Data แล้ว fit เฉพาะ OLS coefficients ไม่เรียน preprocessorหรือทำ backward eliminationจาก Holdout
+- RESULT `RMSE/MAE` คือ Development pooled OOF; fit statistics/coefficients คือ Full-data Refit; `N_OBSERVATION` อ่านจาก `ols_result.nobs` รายโมเดล RESULT 18 และ COEFFICIENT 13 columns คงเดิม
+- เพิ่ม evaluation sidecars ใน `output/analysis/<PCS_DATE>/`: aggregate Development OOF metricsของทุก successful candidate, Rank-1 Holdout metrics, row-level Holdout predictions CSV และ metadata JSON ซึ่งแยก Development checkpoint/Holdout/Full-refit semantics ชัดเจน
+- Bundle version 2.0 เพิ่ม metadataแบบ additiveและคง required keys/preprocessor contractของ Predictor เดิม Joblib ยังคง Rank 1 Full-data coefficient-only refit
+- Source schema เป็น dynamic ทุก run: `SELECT *` ไม่ hardcode optional columns, candidate universeมาจาก Development schema และ data-driven eligibility/type inferenceเรียนใน fold train; optional columnที่เพิ่ม/ลบ/เปลี่ยนชื่อหรือ datatypeจึงถูกประเมินใหม่โดยไม่ใช้ Holdout ส่วน `price` และ `PCS_DATE` เป็น mandatoryและตรวจแบบ case-insensitiveพร้อมปฏิเสธชื่อซ้ำกำกวม
+- Bundleบันทึก `selected_source_features`, frozen preprocessor และ additive `training_feature_schema`; Predictorใช้ schemaตอน trainนี้ จึงไม่รับ featureใหม่เข้ารุ่นเดิมโดยอัตโนมัติและแจ้ง errorเมื่อ featureที่รุ่นเดิมต้องใช้หายไป
+- `USED_CAR_RUN_ID` เป็น optional strict `YYYYMMDD_HHMMSS`; collision checkครอบคลุม outputsทุกไฟล์ก่อน writeแรก และ `scripts/run_training_v4.sh` ใช้ `pipefail`/`tee` ให้ logกับ artifactsใช้ ID เดียวกัน
+- Current source ไม่มี nonempty password defaultแล้วและต้องตั้ง `USED_CAR_DB_PASSWORD` ผ่าน environment ส่วน credentialที่เคย commit/bytecode/historyยังต้อง rotate/cleanupเป็นงานแยก
+- Root `.gitignore` ป้องกัน logs, secrets files, bytecode, `.DS_Store`, generated outputs และ raw listing extractsใหม่ แต่ไม่ untrackหรือลบไฟล์/historyเดิม
+
+Automated tests อยู่ที่ `tests/test_training_evaluation_v4.py` ใช้ synthetic dataเท่านั้น รายละเอียดผลจริงและสิ่งที่ยังไม่ทดสอบอยู่ใน [WORK_LOG.md](WORK_LOG.md)
 
 ## 1. ฐานข้อมูลในการตรวจและ Git
 
@@ -198,10 +220,10 @@ Joblib serializes statsmodels result ซึ่งอาจเก็บ training 
 
 ## 9. Secrets และ Git hygiene ที่ตรวจพบ
 
-1. **พบ credential ฝังในโค้ดและ Git history**: `train_used_car_ols.py:35` มี nonempty default ของ `USED_CAR_DB_PASSWORD` แบบหลายบรรทัด; พบค่าเดียวกันใน tracked `__pycache__/train_used_car_ols.cpython-314.pyc`
+1. **พบ credential ใน Git history เดิม**: V4 เอา nonempty default ออกจาก source ปัจจุบันแล้ว แต่ค่าที่เคยอยู่ใน commits/ tracked bytecode ยังไม่ถูกลบจาก history และยังต้อง rotate
 2. พบ default นี้ในทั้งสาม reachable commits `09fa6ce`, `b03cf40`, `3bd4cad`; commit `b03cf40` มีใน historical `train_used_car_ols_backup.py` ด้วย Live remote master ตรง HEAD จึงมี affected current files ใน remote commit ที่ตรวจได้ ยังไม่ตรวจ validity ของ credential หรือ repository visibility
-3. ไม่มี root `.gitignore`/`.gitattributes`, `.git/info/exclude` ไม่มี active rules, global excludesfile ไม่ได้ตั้ง; `.venv` ถูก ignore เฉพาะด้วย `.venv/.gitignore` ภายในตัวเอง
-4. Ignore probes ยืนยันว่า `.env`, `.env.local`, `.streamlit/secrets.toml`, joblib/output CSV ใหม่, pyc และ `.DS_Store` ยังไม่ถูกป้องกันด้วย ignore policy
+3. V4 เพิ่ม root `.gitignore` สำหรับ `.env*`, Streamlit secrets, logs, bytecode, `.DS_Store`, generated output และ raw extractsใหม่; `.gitattributes` ยังไม่มี
+4. Ignore rules ไม่มีผลย้อนหลังกับไฟล์ที่ track หรือ secretใน history การ untrack/rotation/history cleanup ยังไม่ได้ทำ
 5. ไม่พบ `.env`, `.env.example`, `.streamlit/secrets.toml`; relevant DB environment keys ไม่ได้ตั้งใน audit process แต่ยังไม่ทราบค่าใน terminal/UI process อื่น
 6. ก่อนทำเอกสารมี tracked entries 66 รายการ รวม 35 CSV, 5 joblib, 2 pyc, 10 PNG, 5 Python และ Data Dictionary 1 ไฟล์; raw CSV ขนาด 28,237,950 bytes มี 34,848 rows และคอลัมน์ seller/location/description/URLs รายงาน analysis/prediction/selection มี listing-level data ด้วย
 

@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import re
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -19,7 +20,7 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-from sklearn.model_selection import KFold
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
@@ -34,7 +35,7 @@ DB_DATABASE = os.getenv("USED_CAR_DB_DATABASE", "USED_CAR_DB")
 DB_USER = os.getenv("USED_CAR_DB_USER", "sa")
 DB_PASSWORD = os.getenv(
     "USED_CAR_DB_PASSWORD",
-    "Local_Dev_Only_Pa55word!",
+    "",
 )
 
 DB_DRIVER = os.getenv(
@@ -58,6 +59,7 @@ OUTPUT_DIR = Path(
 
 TARGET_COLUMN = "price"
 PCS_DATE_COLUMN = "PCS_DATE"
+MANDATORY_SOURCE_COLUMNS = (TARGET_COLUMN, PCS_DATE_COLUMN)
 
 TOP_N_MODELS = 3
 P_VALUE_THRESHOLD = 0.05
@@ -68,6 +70,12 @@ CONFIDENCE_LEVEL = 0.95
 
 CV_FOLDS = 5
 RANDOM_STATE = 42
+HOLDOUT_FRACTION = 0.20
+HOLDOUT_FRACTION_TOLERANCE = 0.05
+TARGET_PRICE_MIN_EXCLUSIVE_THB = 1_000.0
+# Fixed business bands used only to balance deterministic splits and report error.
+PRICE_BAND_EDGES = (-np.inf, 300_000, 500_000, 750_000, 1_000_000,
+                    1_500_000, 2_000_000, 3_000_000, 5_000_000, np.inf)
 
 MAX_CANDIDATES = 8  # Keep the original baseline candidate feature combinations.
 # Add matched encoding experiments for the same source-feature sets (no new DB columns).
@@ -117,12 +125,10 @@ OUTLIER_LOG_MAD_FLOOR = 0.10  # Prevent tiny/zero MAD from excessive flags.
 OUTLIER_MAX_BROAD_GROUP_YEAR_SPAN = 3
 OUTLIER_REPORT_BASE_DIR = OUTPUT_DIR.parent / "analysis"
 
-# Price-filter experiment: BASELINE retains every valid positive target;
-# EXPERIMENT removes price <= 1,000 THB and explicitly confirmed bad listing
-# IDs from TRAINING partitions ONLY. Outlier flags never trigger exclusion.
-# Change via shell: USED_CAR_PRICE_FILTER_MODE=EXPERIMENT python3 train_used_car_ols.py
-PRICE_FILTER_MODE = os.getenv("USED_CAR_PRICE_FILTER_MODE", "BASELINE").strip().upper()
-PRICE_FILTER_MAX_THB = 1_000.0
+# V4 target cohort. This uses the known target during training/evaluation only.
+# It must never be used to gate prediction inputs, where actual price is unknown.
+PRICE_FILTER_MODE = "V4_ELIGIBLE"
+PRICE_FILTER_MAX_THB = TARGET_PRICE_MIN_EXCLUSIVE_THB
 # Specify confirmed erroneous listings ONLY after checking the source listing.
 # Strings preserve any leading zeros in listing_id.
 CONFIRMED_BAD_LISTING_IDS: List[str] = []
@@ -221,6 +227,7 @@ class PreprocessorState:
     reference_categories: Dict[str, str]
     encoded_feature_names: List[str]
     feature_groups: Dict[str, List[str]]
+    numeric_like_features: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -251,6 +258,32 @@ class FinalCandidate:
     cv_eligible_rmse: Optional[float] = None
     cv_eligible_mae: Optional[float] = None
     cv_eligible_count: int = 0
+    cv_fold_rmse_mean: Optional[float] = None
+    cv_fold_rmse_std: Optional[float] = None
+    cv_fold_mae_mean: Optional[float] = None
+    cv_fold_mae_std: Optional[float] = None
+    cv_price_band_metrics: List[dict] = field(default_factory=list)
+    cv_other_count: int = 0
+    cv_other_denominator: int = 0
+
+
+@dataclass
+class CVEvaluation:
+    rmse: float
+    mae: float
+    count: int
+    fold_rmse_mean: float
+    fold_rmse_std: float
+    fold_mae_mean: float
+    fold_mae_std: float
+    high_price_mae: Optional[float]
+    negative_rate: float
+    negative_count: int
+    other_rate: Optional[float]
+    other_count: int
+    other_denominator: int
+    price_band_metrics: List[dict]
+    oof_predictions: pd.DataFrame
 
 
 def build_engine() -> Engine:
@@ -294,6 +327,20 @@ def find_column_case_insensitive(
 
 def normalize_required_column_names(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+
+    by_normalized_name: Dict[str, List[str]] = {}
+    for column in df.columns:
+        by_normalized_name.setdefault(str(column).casefold(), []).append(str(column))
+    ambiguous = {
+        name: originals
+        for name, originals in by_normalized_name.items()
+        if len(originals) > 1
+    }
+    if ambiguous:
+        raise RuntimeError(
+            "Source schema contains duplicate case-insensitive column names: "
+            + ", ".join(sorted(ambiguous))
+        )
 
     target_actual = find_column_case_insensitive(df.columns, TARGET_COLUMN)
     pcs_actual = find_column_case_insensitive(df.columns, PCS_DATE_COLUMN)
@@ -527,70 +574,238 @@ def clean_target(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def price_filter_exclusion_reason(df: pd.DataFrame) -> pd.Series:
-    """Return row-level TRAIN-only exclusion reasons without modifying df.
-
-    BASELINE intentionally ignores the experimental filters. EXPERIMENT
-    excludes price <= PRICE_FILTER_MAX_THB or explicitly confirmed bad IDs.
-    Suspected peer outliers are never excluded by this function.
-    """
-    if PRICE_FILTER_MODE not in {"BASELINE", "EXPERIMENT"}:
-        raise ValueError("PRICE_FILTER_MODE must be BASELINE or EXPERIMENT.")
-    if not np.isfinite(PRICE_FILTER_MAX_THB) or PRICE_FILTER_MAX_THB <= 0:
-        raise ValueError("PRICE_FILTER_MAX_THB must be positive and finite.")
-
-    reasons = pd.Series("", index=df.index, dtype="string")
-    if PRICE_FILTER_MODE == "BASELINE":
-        return reasons
-
+def select_eligible_cohort(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+    """Select the V4 training/evaluation cohort from already-clean target rows."""
     prices = pd.to_numeric(df[TARGET_COLUMN], errors="coerce")
-    reasons.loc[prices.le(PRICE_FILTER_MAX_THB)] = (
-        f"PRICE_LE_{PRICE_FILTER_MAX_THB:g}_THB_EXPERIMENT"
+    eligible = prices.gt(TARGET_PRICE_MIN_EXCLUSIVE_THB).fillna(False)
+    reasons = pd.Series("", index=df.index, dtype="string")
+    reasons.loc[~eligible] = (
+        f"PRICE_LE_{TARGET_PRICE_MIN_EXCLUSIVE_THB:g}_THB_NOT_ELIGIBLE"
     )
-    if CONFIRMED_BAD_LISTING_IDS:
-        listing_col = find_column_case_insensitive(df.columns, "listing_id")
-        if listing_col is None:
-            raise RuntimeError("CONFIRMED_BAD_LISTING_IDS was set but listing_id is absent.")
-        confirmed = {str(value).strip() for value in CONFIRMED_BAD_LISTING_IDS}
-        if "" in confirmed:
-            raise ValueError("CONFIRMED_BAD_LISTING_IDS cannot contain empty IDs.")
-        ids = df[listing_col].astype("string").str.strip()
-        flagged = ids.isin(confirmed)
-        both = flagged & reasons.ne("")
-        reasons.loc[flagged & ~both] = "CONFIRMED_BAD_LISTING_ID"
-        reasons.loc[both] = reasons.loc[both] + ";CONFIRMED_BAD_LISTING_ID"
-    return reasons
-
-
-def select_train_rows(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
-    """Apply the same rule to final fit and to each CV TRAIN fold."""
-    reasons = price_filter_exclusion_reason(df)
-    selected = df.loc[reasons.eq("")].copy()
+    selected = df.loc[eligible].copy()
     if len(selected) < max(30, CV_FOLDS * 5):
         raise RuntimeError(
-            f"PRICE_FILTER_MODE={PRICE_FILTER_MODE}: only {len(selected):,} "
-            "training rows remain; aborting."
+            f"Only {len(selected):,} rows have {TARGET_COLUMN} > "
+            f"{TARGET_PRICE_MIN_EXCLUSIVE_THB:,.0f}."
         )
     return selected, reasons
 
 
+def price_filter_exclusion_reason(df: pd.DataFrame) -> pd.Series:
+    """Backward-compatible wrapper for the permanent V4 cohort rule."""
+    return select_eligible_cohort(df)[1]
+
+
+def select_train_rows(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+    """Backward-compatible wrapper; V4 applies the rule before any split."""
+    return select_eligible_cohort(df)
+
+
 def price_filter_eligible_validation_mask(df: pd.DataFrame) -> pd.Series:
-    """Same operational evaluation cohort across BASELINE and EXPERIMENT."""
-    eligible = pd.to_numeric(df[TARGET_COLUMN], errors="coerce").gt(PRICE_FILTER_MAX_THB)
-    if CONFIRMED_BAD_LISTING_IDS:
-        listing_col = find_column_case_insensitive(df.columns, "listing_id")
-        if listing_col is None:
-            raise RuntimeError("CONFIRMED_BAD_LISTING_IDS was set but listing_id is absent.")
-        confirmed = {str(value).strip() for value in CONFIRMED_BAD_LISTING_IDS}
-        eligible &= ~df[listing_col].astype("string").str.strip().isin(confirmed)
-    return eligible.fillna(False)
+    return pd.to_numeric(df[TARGET_COLUMN], errors="coerce").gt(
+        TARGET_PRICE_MIN_EXCLUSIVE_THB
+    ).fillna(False)
+
+
+def _normalize_identity(series: pd.Series) -> pd.Series:
+    values = series.astype("string").str.strip().str.casefold()
+    return values.mask(values.isna() | values.isin(["", "nan", "none", "null"]))
+
+
+def build_duplicate_groups(df: pd.DataFrame) -> pd.Series:
+    """Build transitive identity groups without exposing the identities."""
+    n = len(df)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    for requested in ("listing_id", "source_url"):
+        actual = find_column_case_insensitive(df.columns, requested)
+        if actual is None:
+            continue
+        first_seen: Dict[str, int] = {}
+        for pos, value in enumerate(_normalize_identity(df[actual]).tolist()):
+            if pd.isna(value):
+                continue
+            key = str(value)
+            if key in first_seen:
+                union(pos, first_seen[key])
+            else:
+                first_seen[key] = pos
+
+    roots = [find(i) for i in range(n)]
+    canonical = {root: seq for seq, root in enumerate(sorted(set(roots)))}
+    return pd.Series(
+        [f"G{canonical[root]:08d}" for root in roots],
+        index=df.index,
+        dtype="string",
+        name="DUPLICATE_GROUP",
+    )
+
+
+def make_price_bands(prices: pd.Series, n_splits: int) -> pd.Series:
+    bands = pd.cut(
+        pd.to_numeric(prices, errors="raise"),
+        bins=PRICE_BAND_EDGES,
+        right=True,
+        include_lowest=True,
+        labels=False,
+    ).astype("int64")
+    counts = bands.value_counts()
+    if counts.empty or int(counts.min()) < n_splits:
+        return pd.Series(0, index=prices.index, dtype="int64")
+    return bands
+
+
+def fixed_price_bands(prices: pd.Series) -> pd.Series:
+    """Business price bands for reporting, independent of split feasibility."""
+    return pd.cut(
+        pd.to_numeric(prices, errors="raise"),
+        bins=PRICE_BAND_EDGES,
+        right=True,
+        include_lowest=True,
+    )
+
+
+def _assignment_checksum(assignments: Sequence[Tuple[int, str]]) -> str:
+    payload = "\n".join(f"{row}:{label}" for row, label in assignments)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def split_development_holdout(
+    df: pd.DataFrame,
+    groups: pd.Series,
+    test_size: float = HOLDOUT_FRACTION,
+    random_state: int = RANDOM_STATE,
+) -> Tuple[pd.DataFrame, pd.DataFrame, dict]:
+    if not math.isclose(test_size, 0.20):
+        raise ValueError("V4 requires a 20% holdout.")
+    if len(df) != len(groups) or len(df) < CV_FOLDS * 2:
+        raise ValueError("Invalid rows/groups for Development/Holdout split.")
+    group_values = groups.loc[df.index].astype(str).to_numpy()
+    if len(set(group_values)) < CV_FOLDS:
+        raise ValueError("At least five duplicate groups are required.")
+    bands = make_price_bands(df[TARGET_COLUMN], CV_FOLDS).to_numpy()
+    has_duplicate_groups = len(set(group_values)) < len(group_values)
+    if has_duplicate_groups:
+        splitter = StratifiedGroupKFold(
+            n_splits=CV_FOLDS, shuffle=True, random_state=random_state
+        )
+        candidates = list(splitter.split(df, bands, group_values))
+        method = "STRATIFIED_GROUP_5_WAY_CLOSEST_HOLDOUT"
+    else:
+        splitter = StratifiedKFold(
+            n_splits=CV_FOLDS, shuffle=True, random_state=random_state
+        )
+        candidates = list(splitter.split(df, bands))
+        method = "STRATIFIED_5_WAY_CLOSEST_HOLDOUT"
+    dev_pos, holdout_pos = min(
+        candidates,
+        key=lambda pair: abs((len(pair[1]) / len(df)) - test_size),
+    )
+    actual_fraction = len(holdout_pos) / len(df)
+    if abs(actual_fraction - test_size) > HOLDOUT_FRACTION_TOLERANCE:
+        raise ValueError(
+            "No group-safe holdout is within the allowed fraction tolerance: "
+            f"target={test_size:.3f}, actual={actual_fraction:.3f}, "
+            f"tolerance={HOLDOUT_FRACTION_TOLERANCE:.3f}."
+        )
+    if set(group_values[dev_pos]) & set(group_values[holdout_pos]):
+        raise RuntimeError("Duplicate identity crossed Development/Holdout.")
+    dev = df.iloc[dev_pos].copy()
+    holdout = df.iloc[holdout_pos].copy()
+    labels = [(int(pos), "DEVELOPMENT") for pos in dev_pos]
+    labels += [(int(pos), "HOLDOUT") for pos in holdout_pos]
+    report_bands = fixed_price_bands(df[TARGET_COLUMN]).astype(str).to_numpy()
+    metadata = {
+        "method": method,
+        "random_state": random_state,
+        "development_rows": len(dev),
+        "holdout_rows": len(holdout),
+        "target_holdout_fraction": test_size,
+        "actual_holdout_fraction": actual_fraction,
+        "holdout_fraction_tolerance": HOLDOUT_FRACTION_TOLERANCE,
+        "group_count": len(set(group_values)),
+        "duplicate_group_count": int(pd.Series(group_values).value_counts().gt(1).sum()),
+        "assignment_checksum": _assignment_checksum(sorted(labels)),
+        "development_price_band_counts": {
+            str(k): int(v) for k, v in pd.Series(report_bands[dev_pos]).value_counts().sort_index().items()
+        },
+        "holdout_price_band_counts": {
+            str(k): int(v) for k, v in pd.Series(report_bands[holdout_pos]).value_counts().sort_index().items()
+        },
+    }
+    metadata["checksum"] = metadata["assignment_checksum"]
+    return dev, holdout, metadata
+
+
+def build_common_cv_folds(
+    dev_df: pd.DataFrame,
+    groups: pd.Series,
+    n_splits: int = CV_FOLDS,
+    random_state: int = RANDOM_STATE,
+) -> Tuple[List[Tuple[np.ndarray, np.ndarray]], dict]:
+    group_values = groups.loc[dev_df.index].astype(str).to_numpy()
+    if len(set(group_values)) < n_splits:
+        raise ValueError(f"At least {n_splits} Development groups are required.")
+    bands = make_price_bands(dev_df[TARGET_COLUMN], n_splits).to_numpy()
+    has_duplicate_groups = len(set(group_values)) < len(group_values)
+    if has_duplicate_groups:
+        splitter = StratifiedGroupKFold(
+            n_splits=n_splits, shuffle=True, random_state=random_state
+        )
+        raw_folds = splitter.split(dev_df, bands, group_values)
+        method = "STRATIFIED_GROUP_KFOLD"
+    else:
+        splitter = StratifiedKFold(
+            n_splits=n_splits, shuffle=True, random_state=random_state
+        )
+        raw_folds = splitter.split(dev_df, bands)
+        method = "STRATIFIED_KFOLD"
+    folds = [(np.asarray(tr, dtype=int), np.asarray(va, dtype=int))
+             for tr, va in raw_folds]
+    seen: List[int] = []
+    checksum_rows: List[Tuple[int, str]] = []
+    for fold_id, (train_pos, valid_pos) in enumerate(folds, start=1):
+        if set(train_pos) & set(valid_pos):
+            raise RuntimeError(f"Fold {fold_id} train/validation overlap.")
+        if set(group_values[train_pos]) & set(group_values[valid_pos]):
+            raise RuntimeError(f"Duplicate identity crossed fold {fold_id}.")
+        seen.extend(valid_pos.tolist())
+        checksum_rows.extend((int(pos), f"FOLD_{fold_id}") for pos in valid_pos)
+    if sorted(seen) != list(range(len(dev_df))):
+        raise RuntimeError("Each Development row must validate exactly once.")
+    report_bands = fixed_price_bands(dev_df[TARGET_COLUMN]).astype(str).to_numpy()
+    metadata = {
+        "method": method,
+        "n_splits": n_splits,
+        "random_state": random_state,
+        "fold_sizes": [len(valid) for _, valid in folds],
+        "assignment_checksum": _assignment_checksum(sorted(checksum_rows)),
+        "fold_price_band_counts": [
+            {str(k): int(v) for k, v in pd.Series(report_bands[valid]).value_counts().sort_index().items()}
+            for _, valid in folds
+        ],
+    }
+    metadata["checksum"] = metadata["assignment_checksum"]
+    return folds, metadata
 
 
 def export_train_row_selection_report(
     cleaned_df: pd.DataFrame, reasons: pd.Series,
     pcs_date: pd.Timestamp, run_id: str,
+    split_assignments: Optional[pd.Series] = None,
 ) -> Path:
-    """Audit the final-fit row selection without changing the source table."""
+    """Audit V4 eligibility and evaluation assignment without changing STG."""
     report = pd.DataFrame(index=cleaned_df.index)
     report["SOURCE_ROW_NUMBER"] = cleaned_df.index.to_numpy() + 1
     listing_col = find_column_case_insensitive(cleaned_df.columns, "listing_id")
@@ -599,8 +814,14 @@ def export_train_row_selection_report(
     )
     report["price"] = cleaned_df[TARGET_COLUMN]
     report["PRICE_FILTER_MODE"] = PRICE_FILTER_MODE
+    report["ELIGIBLE_FOR_EVALUATION"] = np.where(reasons.eq(""), "Y", "N")
     report["USED_FOR_TRAIN"] = np.where(reasons.eq(""), "Y", "N")
     report["EXCLUSION_REASON"] = reasons.to_numpy()
+    if split_assignments is None:
+        report["EVALUATION_SPLIT"] = np.where(reasons.eq(""), "UNASSIGNED", "EXCLUDED")
+    else:
+        aligned = split_assignments.reindex(cleaned_df.index).fillna("EXCLUDED")
+        report["EVALUATION_SPLIT"] = aligned.to_numpy()
     report["PCS_DATE"] = pcs_date.date().isoformat()
     report_dir = PRICE_SELECTION_REPORT_BASE_DIR / pcs_date.strftime("%Y%m%d")
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -645,6 +866,28 @@ def maybe_convert_numeric_like_columns(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = pd.to_numeric(full_cleaned, errors="coerce")
 
     return df
+
+
+def numeric_conversion_ratio(series: pd.Series) -> float:
+    non_null = series.dropna()
+    if non_null.empty:
+        return 0.0
+    cleaned = (
+        non_null.astype(str).str.strip().str.replace(",", "", regex=False)
+    )
+    converted = pd.to_numeric(cleaned, errors="coerce").replace(
+        [np.inf, -np.inf], np.nan
+    )
+    return float(converted.notna().mean())
+
+
+def coerce_numeric_like(series: pd.Series) -> pd.Series:
+    cleaned = (
+        series.astype("string").str.strip().str.replace(",", "", regex=False)
+    )
+    return pd.to_numeric(cleaned, errors="coerce").replace(
+        [np.inf, -np.inf], np.nan
+    )
 
 
 def matches_exclusion_pattern(column_name: str) -> bool:
@@ -703,6 +946,10 @@ def infer_eligible_features(df: pd.DataFrame) -> Tuple[List[str], List[Tuple[str
             eligible.append(col)
             continue
 
+        if numeric_conversion_ratio(series) >= NUMERIC_COERCE_THRESHOLD:
+            eligible.append(col)
+            continue
+
         unique_ratio = unique_count / max(len(non_null), 1)
 
         if lower in CORE_VEHICLE_FEATURES or lower in OPTIONAL_VEHICLE_FEATURES:
@@ -725,6 +972,29 @@ def infer_eligible_features(df: pd.DataFrame) -> Tuple[List[str], List[Tuple[str
         )
 
     return eligible, excluded
+
+
+def infer_candidate_universe(df: pd.DataFrame) -> List[str]:
+    """Discover candidate columns without learning value distributions."""
+    force_include = {c.lower() for c in FORCE_INCLUDE_COLUMNS}
+    force_exclude = {c.lower() for c in FORCE_EXCLUDE_COLUMNS}
+    exact_exclude = {c.lower() for c in EXCLUDE_COLUMNS_EXACT}
+    candidates = []
+    for col in df.columns:
+        lower = col.lower()
+        if lower in force_include:
+            candidates.append(col)
+        elif lower in force_exclude or lower in exact_exclude:
+            continue
+        elif matches_exclusion_pattern(col):
+            continue
+        elif pd.api.types.is_datetime64_any_dtype(df[col]):
+            continue
+        else:
+            candidates.append(col)
+    if not candidates:
+        raise RuntimeError("No candidate columns remain after schema exclusions.")
+    return candidates
 
 
 def normalize_category_series(series: pd.Series) -> pd.Series:
@@ -757,6 +1027,7 @@ def fit_preprocessor(
         raise ValueError(f"Unknown encoding profile: {encoding_profile}")
     profile = ENCODING_PROFILES[encoding_profile]
     numeric_features = []
+    numeric_like_features = []
     categorical_features = []
     numeric_medians: Dict[str, float] = {}
     category_levels: Dict[str, List[str]] = {}
@@ -766,8 +1037,14 @@ def fit_preprocessor(
     for col in source_features:
         s = df[col]
 
+        missing_ratio = s.isna().mean()
+        if missing_ratio > MAX_MISSING_RATIO or s.dropna().nunique() <= 1:
+            continue
+
         if pd.api.types.is_numeric_dtype(s):
-            values = pd.to_numeric(s, errors="coerce").astype(float)
+            values = pd.to_numeric(s, errors="coerce").astype(float).replace(
+                [np.inf, -np.inf], np.nan
+            )
             median = values.median()
             if pd.isna(median):
                 continue
@@ -777,8 +1054,28 @@ def fit_preprocessor(
             feature_groups[col] = [col]
             continue
 
+        if numeric_conversion_ratio(s) >= NUMERIC_COERCE_THRESHOLD:
+            values = coerce_numeric_like(s).astype(float)
+            median = values.median()
+            if pd.isna(median):
+                continue
+            numeric_features.append(col)
+            numeric_like_features.append(col)
+            numeric_medians[col] = float(median)
+            feature_groups[col] = [col]
+            continue
+
         values = normalize_category_series(s)
         counts = values.value_counts(dropna=False)
+
+        unique_count = int(s.dropna().nunique())
+        unique_ratio = unique_count / max(int(s.notna().sum()), 1)
+        if (
+            col.lower() not in CORE_VEHICLE_FEATURES + OPTIONAL_VEHICLE_FEATURES
+            and (unique_count > MAX_CATEGORICAL_LEVELS
+                 or unique_ratio > MAX_CATEGORICAL_UNIQUE_RATIO)
+        ):
+            continue
 
         # Learn frequency grouping ONLY on the training partition. Future
         # observations use the exact same stored category levels and OTHER rule.
@@ -789,9 +1086,10 @@ def fit_preprocessor(
         retained = [str(v) for v in frequent.index if str(v) != "__OTHER__"][:max_levels - 1]
         if not retained:
             retained = [str(counts.index[0])]
-        if "__OTHER__" not in retained:
-            values = values.where(values.isin(retained), "__OTHER__")
+        values = values.where(values.isin(retained), "__OTHER__")
         counts = values.value_counts(dropna=False)
+        if "__OTHER__" not in counts.index:
+            counts.loc["__OTHER__"] = 0
         levels = [str(x) for x in counts.index.tolist()]
 
         if len(levels) <= 1:
@@ -834,6 +1132,7 @@ def fit_preprocessor(
         reference_categories=reference_categories,
         encoded_feature_names=encoded_feature_names,
         feature_groups=feature_groups,
+        numeric_like_features=numeric_like_features,
     )
 
 
@@ -846,8 +1145,10 @@ def transform_with_preprocessor(
     encoded: Dict[str, pd.Series] = {}
 
     for col in state.numeric_features:
-        values = pd.to_numeric(df[col], errors="coerce").astype(float)
-        values = values.replace([np.inf, -np.inf], np.nan)
+        # Apply one coercion path for numeric, string and categorical dtypes so
+        # legacy consumers that reconstruct state without numeric_like_features
+        # still transform prediction rows identically.
+        values = coerce_numeric_like(df[col]).astype(float)
         encoded[col] = values.fillna(state.numeric_medians[col])
 
     for col in state.categorical_features:
@@ -1038,104 +1339,113 @@ def evaluate_candidate_cv(
     df: pd.DataFrame,
     initial_source_features: Sequence[str],
     encoding_profile: str = "BASELINE",
-) -> Tuple[float, float, Optional[float], float, Optional[float], float, float, int]:
-    # CV validation folds are ALWAYS drawn from the same clean_target cohort.
-    # EXPERIMENT filters each fold's TRAIN partition; it never filters VALIDATION.
-    # Return fold-mean RMSE/MAE as before plus out-of-fold diagnostics.
-    # HIGH_PRICE_MIN_THB and __OTHER__ are diagnostics, not candidate ranking rules.
-    y_all = df[TARGET_COLUMN].astype(float)
+    folds: Optional[Sequence[Tuple[np.ndarray, np.ndarray]]] = None,
+) -> CVEvaluation:
+    """Evaluate one candidate on common eligible-Development folds."""
+    if not df[TARGET_COLUMN].gt(TARGET_PRICE_MIN_EXCLUSIVE_THB).all():
+        raise ValueError("CV input must contain only the V4 eligible cohort.")
+    if folds is None:
+        groups = build_duplicate_groups(df)
+        folds, _ = build_common_cv_folds(df, groups)
 
-    kfold = KFold(
-        n_splits=CV_FOLDS,
-        shuffle=True,
-        random_state=RANDOM_STATE,
-    )
-
-    rmses: List[float] = []
-    maes: List[float] = []
-    tail_absolute_errors: List[np.ndarray] = []
-    negative_predictions = 0
-    n_validated = 0
-    other_model_count = 0
-    n_model_mapped = 0
-    eligible_sum_abs = 0.0
-    eligible_sum_sq = 0.0
-    eligible_count = 0
-
-    for train_idx, valid_idx in kfold.split(df):
-        original_train_df = df.iloc[train_idx]
-        train_df, _ = select_train_rows(original_train_df)
-        valid_df = df.iloc[valid_idx]  # Never filter validation rows.
-
-        y_train = train_df[TARGET_COLUMN].astype(float)
-        y_valid = y_all.iloc[valid_idx]
-
-        state = fit_preprocessor(train_df, initial_source_features, encoding_profile)
-
+    fold_rmses: List[float] = []
+    fold_maes: List[float] = []
+    records: List[pd.DataFrame] = []
+    for fold_id, (train_idx, valid_idx) in enumerate(folds, start=1):
+        train_df = df.iloc[train_idx]
+        valid_df = df.iloc[valid_idx]
+        fold_eligible, _ = infer_eligible_features(train_df)
+        fold_features = [c for c in initial_source_features if c in fold_eligible]
+        if len(fold_features) < MIN_SOURCE_FEATURES:
+            raise RuntimeError(
+                f"Fold {fold_id}: candidate has no usable fold-train features."
+            )
+        state = fit_preprocessor(train_df, fold_features, encoding_profile)
         X_train = transform_with_preprocessor(train_df, state)
         X_valid = transform_with_preprocessor(valid_df, state)
-
         if X_train.shape[1] == 0:
-            raise RuntimeError(
-                "Candidate produced no encoded predictors."
-            )
-
-        model, _, selected_encoded, _ = (
-            backward_eliminate_source_features(
-                X_train,
-                y_train,
-                state.feature_groups,
-            )
+            raise RuntimeError(f"Fold {fold_id}: no encoded predictors.")
+        model, _, selected_encoded, _ = backward_eliminate_source_features(
+            X_train, train_df[TARGET_COLUMN].astype(float), state.feature_groups
         )
-
-        X_valid_selected = X_valid[selected_encoded]
         X_valid_const = sm.add_constant(
-            X_valid_selected,
-            has_constant="add",
-        )
-
+            X_valid[selected_encoded], has_constant="add"
+        ).reindex(columns=model.params.index, fill_value=0.0)
         pred = np.asarray(model.predict(X_valid_const), dtype=float)
+        if len(pred) != len(valid_df) or not np.isfinite(pred).all():
+            raise RuntimeError(f"Fold {fold_id}: invalid predictions.")
+        actual = valid_df[TARGET_COLUMN].to_numpy(dtype=float)
+        errors = actual - pred
+        fold_rmses.append(float(math.sqrt(np.mean(np.square(errors)))))
+        fold_maes.append(float(np.mean(np.abs(errors))))
 
-        rmse = math.sqrt(mean_squared_error(y_valid, pred))
-        mae = mean_absolute_error(y_valid, pred)
-
-        rmses.append(float(rmse))
-        maes.append(float(mae))
-
-        y_np = y_valid.to_numpy(dtype=float)
-        # Report metrics for the same eligible-price cohort in BOTH modes,
-        # in addition to unchanged full-validation metrics used for ranking.
-        eligible = price_filter_eligible_validation_mask(valid_df).to_numpy(dtype=bool)
-        if eligible.any():
-            errors = y_np[eligible] - pred[eligible]
-            eligible_sum_abs += float(np.abs(errors).sum())
-            eligible_sum_sq += float(np.square(errors).sum())
-            eligible_count += int(eligible.sum())
-        tail = y_np >= HIGH_PRICE_MIN_THB
-        if tail.any():
-            tail_absolute_errors.append(np.abs(y_np[tail] - pred[tail]))
-        negative_predictions += int((pred < 0).sum())
-        n_validated += len(pred)
-        model_col = next((col for col in state.categorical_features
-                          if col.lower() == "model"), None)
-        if model_col:
+        mapped_model = pd.Series(pd.NA, index=valid_df.index, dtype="string")
+        model_col = next(
+            (c for c in state.categorical_features if c.lower() == "model"), None
+        )
+        if model_col is not None:
             values = normalize_category_series(valid_df[model_col])
             levels = state.category_levels[model_col]
-            fallback = "__OTHER__" if "__OTHER__" in levels else state.reference_categories[model_col]
-            mapped = values.where(values.isin(levels), fallback)
-            other_model_count += int(mapped.eq("__OTHER__").sum())
-            n_model_mapped += len(mapped)
+            fallback = (
+                "__OTHER__" if "__OTHER__" in levels
+                else state.reference_categories[model_col]
+            )
+            mapped_model = values.where(values.isin(levels), fallback).astype("string")
+        records.append(pd.DataFrame({
+            "ROW_POSITION": np.asarray(valid_idx, dtype=int),
+            "FOLD": fold_id,
+            "ACTUAL_PRICE": actual,
+            "PREDICTED_PRICE": pred,
+            "ERROR": errors,
+            "ABS_ERROR": np.abs(errors),
+            "MODEL_CATEGORY": mapped_model.to_numpy(),
+        }))
 
-    high_price_mae = (float(np.concatenate(tail_absolute_errors).mean())
-                      if tail_absolute_errors else None)
-    other_rate = other_model_count / n_model_mapped if n_model_mapped else None
-    eligible_rmse = (math.sqrt(eligible_sum_sq / eligible_count)
-                     if eligible_count else float("nan"))
-    eligible_mae = (eligible_sum_abs / eligible_count
-                    if eligible_count else float("nan"))
-    return (float(np.mean(rmses)), float(np.mean(maes)), high_price_mae,
-            negative_predictions / n_validated, other_rate,
-            eligible_rmse, eligible_mae, eligible_count)
+    oof = pd.concat(records, ignore_index=True).sort_values("ROW_POSITION")
+    if oof["ROW_POSITION"].tolist() != list(range(len(df))):
+        raise RuntimeError("OOF predictions do not cover Development exactly once.")
+    errors = oof["ERROR"].to_numpy(dtype=float)
+    rmse = float(math.sqrt(np.mean(np.square(errors))))
+    mae = float(np.mean(np.abs(errors)))
+    negative_count = int(oof["PREDICTED_PRICE"].lt(0).sum())
+    model_denominator = int(oof["MODEL_CATEGORY"].notna().sum())
+    other_count = int(oof["MODEL_CATEGORY"].eq("__OTHER__").sum())
+    other_rate = (
+        other_count / model_denominator if model_denominator else None
+    )
+    tail = oof["ACTUAL_PRICE"].ge(HIGH_PRICE_MIN_THB)
+    high_price_mae = (
+        float(oof.loc[tail, "ABS_ERROR"].mean()) if tail.any() else None
+    )
+    banded = pd.cut(
+        oof["ACTUAL_PRICE"], PRICE_BAND_EDGES, include_lowest=True
+    )
+    price_band_metrics = []
+    for interval, part in oof.groupby(banded, observed=True):
+        band_errors = part["ERROR"].to_numpy(dtype=float)
+        price_band_metrics.append({
+            "price_band": str(interval),
+            "count": len(part),
+            "rmse": float(math.sqrt(np.mean(np.square(band_errors)))),
+            "mae": float(np.mean(np.abs(band_errors))),
+        })
+    return CVEvaluation(
+        rmse=rmse,
+        mae=mae,
+        count=len(oof),
+        fold_rmse_mean=float(np.mean(fold_rmses)),
+        fold_rmse_std=float(np.std(fold_rmses, ddof=0)),
+        fold_mae_mean=float(np.mean(fold_maes)),
+        fold_mae_std=float(np.std(fold_maes, ddof=0)),
+        high_price_mae=high_price_mae,
+        negative_rate=negative_count / len(oof),
+        negative_count=negative_count,
+        other_rate=other_rate,
+        other_count=other_count,
+        other_denominator=model_denominator,
+        price_band_metrics=price_band_metrics,
+        oof_predictions=oof,
+    )
 
 
 def fit_final_candidate(
@@ -1151,7 +1461,17 @@ def fit_final_candidate(
     cv_eligible_rmse: Optional[float] = None,
     cv_eligible_mae: Optional[float] = None,
     cv_eligible_count: int = 0,
+    cv_evaluation: Optional[CVEvaluation] = None,
 ) -> FinalCandidate:
+    if cv_evaluation is not None:
+        cv_rmse = cv_evaluation.rmse
+        cv_mae = cv_evaluation.mae
+        cv_high_price_mae = cv_evaluation.high_price_mae
+        cv_negative_rate = cv_evaluation.negative_rate
+        cv_model_other_rate = cv_evaluation.other_rate
+        cv_eligible_rmse = cv_evaluation.rmse
+        cv_eligible_mae = cv_evaluation.mae
+        cv_eligible_count = cv_evaluation.count
     state = fit_preprocessor(df, initial_source_features, encoding_profile)
 
     X = transform_with_preprocessor(df, state)
@@ -1201,7 +1521,115 @@ def fit_final_candidate(
         cv_eligible_rmse=cv_eligible_rmse,
         cv_eligible_mae=cv_eligible_mae,
         cv_eligible_count=cv_eligible_count,
+        cv_fold_rmse_mean=(cv_evaluation.fold_rmse_mean if cv_evaluation else None),
+        cv_fold_rmse_std=(cv_evaluation.fold_rmse_std if cv_evaluation else None),
+        cv_fold_mae_mean=(cv_evaluation.fold_mae_mean if cv_evaluation else None),
+        cv_fold_mae_std=(cv_evaluation.fold_mae_std if cv_evaluation else None),
+        cv_price_band_metrics=(cv_evaluation.price_band_metrics if cv_evaluation else []),
+        cv_other_count=(cv_evaluation.other_count if cv_evaluation else 0),
+        cv_other_denominator=(cv_evaluation.other_denominator if cv_evaluation else 0),
     )
+
+
+def refit_candidate_coefficients(
+    checkpoint: FinalCandidate,
+    full_df: pd.DataFrame,
+) -> FinalCandidate:
+    """Refit only OLS coefficients using the frozen Development design."""
+    X = transform_with_preprocessor(full_df, checkpoint.preprocessor)
+    selected = checkpoint.selected_encoded_features
+    missing = [name for name in selected if name not in X.columns]
+    if missing:
+        raise RuntimeError(f"Frozen refit is missing encoded columns: {missing}")
+    model = fit_ols(X[selected], full_df[TARGET_COLUMN].astype(float))
+    if int(model.nobs) != len(full_df):
+        raise RuntimeError(
+            f"Full refit used {int(model.nobs):,}/{len(full_df):,} rows."
+        )
+    source_pvalues = {
+        source: source_feature_p_value(
+            model,
+            [c for c in checkpoint.preprocessor.feature_groups[source]
+             if c in selected],
+        )
+        for source in checkpoint.selected_source_features
+    }
+    f_stat = float(model.fvalue) if model.fvalue is not None and np.isfinite(model.fvalue) else None
+    f_p = float(model.f_pvalue) if model.f_pvalue is not None and np.isfinite(model.f_pvalue) else None
+    return replace(
+        checkpoint,
+        ols_result=model,
+        r_squared=float(model.rsquared),
+        adj_r_squared=float(model.rsquared_adj),
+        f_statistic=f_stat,
+        f_p_value=f_p,
+        source_feature_p_values=source_pvalues,
+    )
+
+
+def evaluate_frozen_candidate(
+    checkpoint: FinalCandidate,
+    holdout_df: pd.DataFrame,
+) -> Tuple[dict, pd.DataFrame]:
+    X = transform_with_preprocessor(holdout_df, checkpoint.preprocessor)
+    X_const = sm.add_constant(
+        X[checkpoint.selected_encoded_features], has_constant="add"
+    ).reindex(columns=checkpoint.ols_result.params.index, fill_value=0.0)
+    pred = np.asarray(checkpoint.ols_result.predict(X_const), dtype=float)
+    actual = holdout_df[TARGET_COLUMN].to_numpy(dtype=float)
+    errors = actual - pred
+    if not np.isfinite(pred).all():
+        raise RuntimeError("Holdout predictions contain non-finite values.")
+    mapped_model = pd.Series(pd.NA, index=holdout_df.index, dtype="string")
+    model_col = next(
+        (c for c in checkpoint.preprocessor.categorical_features
+         if c.lower() == "model"), None
+    )
+    if model_col is not None:
+        values = normalize_category_series(holdout_df[model_col])
+        levels = checkpoint.preprocessor.category_levels[model_col]
+        fallback = (
+            "__OTHER__" if "__OTHER__" in levels
+            else checkpoint.preprocessor.reference_categories[model_col]
+        )
+        mapped_model = values.where(values.isin(levels), fallback).astype("string")
+    predictions = pd.DataFrame({
+        "SOURCE_ROW_NUMBER": holdout_df.index.to_numpy(dtype=int) + 1,
+        "ACTUAL_PRICE": actual,
+        "PREDICTED_PRICE": pred,
+        "ERROR": errors,
+        "ABS_ERROR": np.abs(errors),
+        "NEGATIVE_PREDICTION": np.where(pred < 0, "Y", "N"),
+        "MODEL_CATEGORY": mapped_model.to_numpy(),
+    })
+    other_denominator = int(predictions["MODEL_CATEGORY"].notna().sum())
+    other_count = int(predictions["MODEL_CATEGORY"].eq("__OTHER__").sum())
+    price_band_metrics = []
+    banded = pd.cut(
+        predictions["ACTUAL_PRICE"], PRICE_BAND_EDGES, include_lowest=True
+    )
+    for interval, part in predictions.groupby(banded, observed=True):
+        band_errors = part["ERROR"].to_numpy(dtype=float)
+        price_band_metrics.append({
+            "price_band": str(interval),
+            "count": len(part),
+            "rmse": float(math.sqrt(np.mean(np.square(band_errors)))),
+            "mae": float(np.mean(np.abs(band_errors))),
+        })
+    metrics = {
+        "stage": "HOLDOUT_TEST_DEVELOPMENT_CHECKPOINT",
+        "count": len(predictions),
+        "rmse": float(math.sqrt(np.mean(np.square(errors)))),
+        "mae": float(np.mean(np.abs(errors))),
+        "negative_count": int((pred < 0).sum()),
+        "negative_rate": float((pred < 0).mean()),
+        "other_count": other_count,
+        "other_denominator": other_denominator,
+        "other_rate": (other_count / other_denominator
+                       if other_denominator else None),
+        "price_band_metrics": price_band_metrics,
+    }
+    return metrics, predictions
 
 
 def rank_candidates(
@@ -1228,12 +1656,12 @@ def rank_candidates(
         new_key = (
             candidate.cv_rmse,
             candidate.cv_mae,
-            -candidate.adj_r_squared,
+            candidate.candidate_id,
         )
         current_key = (
             current.cv_rmse,
             current.cv_mae,
-            -current.adj_r_squared,
+            current.candidate_id,
         )
 
         if new_key < current_key:
@@ -1245,7 +1673,7 @@ def rank_candidates(
         key=lambda c: (
             c.cv_rmse,
             c.cv_mae,
-            -c.adj_r_squared,
+            c.candidate_id,
         )
     )
 
@@ -1264,7 +1692,6 @@ def build_result_dataframe(
     top_candidates: Sequence[FinalCandidate],
     run_datetime: datetime,
     pcs_date: pd.Timestamp,
-    n_observation: int,
 ) -> Tuple[pd.DataFrame, Dict[int, str]]:
     model_ids: Dict[int, str] = {}
     rows = []
@@ -1276,6 +1703,9 @@ def build_result_dataframe(
         model_id = model_id_for_rank(run_datetime, rank)
         model_ids[candidate.candidate_id] = model_id
 
+        n_observation = int(candidate.ols_result.nobs)
+        if not math.isclose(float(candidate.ols_result.nobs), n_observation):
+            raise RuntimeError("OLS nobs must be an integer row count.")
         rows.append(
             {
                 "MODEL_ID": model_id,
@@ -1283,7 +1713,7 @@ def build_result_dataframe(
                 "TARGET_NAME": TARGET_COLUMN,
                 "TRAIN_PCS_DATE": pcs_date_str,
                 "TRAIN_DATE": train_date_str,
-                "N_OBSERVATION": int(n_observation),
+                "N_OBSERVATION": n_observation,
                 "R_SQUARED": candidate.r_squared,
                 "ADJ_R_SQUARED": candidate.adj_r_squared,
                 "MAE": candidate.cv_mae,
@@ -1486,7 +1916,11 @@ def build_top1_model_bundle(
     state = top_candidate.preprocessor
 
     bundle = {
-        "artifact_version": "1.0",
+        "artifact_version": "2.0",
+        "training_evaluation_version": "V4",
+        "target_cohort_rule": f"{TARGET_COLUMN} > {TARGET_PRICE_MIN_EXCLUSIVE_THB:g}",
+        "holdout_metrics_apply_to": "DEVELOPMENT_CHECKPOINT_NOT_EXPORTED_REFIT",
+        "exported_model_stage": "FULL_DATA_FROZEN_DESIGN_COEFFICIENT_REFIT",
         "encoding_profile": top_candidate.encoding_profile,
         "price_filter_mode": PRICE_FILTER_MODE,
         "price_filter_max_thb": PRICE_FILTER_MAX_THB,
@@ -1509,6 +1943,16 @@ def build_top1_model_bundle(
         "adj_r_squared": top_candidate.adj_r_squared,
         "selected_source_features": top_candidate.selected_source_features,
         "selected_encoded_features": top_candidate.selected_encoded_features,
+        # Persist the learned model-input schema. Prediction must use this
+        # snapshot even if STG_USED_CAR gains, loses or changes other columns.
+        "training_feature_schema": {
+            feature: (
+                "numeric"
+                if feature in state.numeric_features
+                else "categorical"
+            )
+            for feature in top_candidate.selected_source_features
+        },
         "source_feature_p_values": top_candidate.source_feature_p_values,
         "preprocessor": {
             "numeric_features": state.numeric_features,
@@ -1518,6 +1962,7 @@ def build_top1_model_bundle(
             "reference_categories": state.reference_categories,
             "encoded_feature_names": state.encoded_feature_names,
             "feature_groups": state.feature_groups,
+            "numeric_like_features": state.numeric_like_features,
         },
         "ols_result": top_candidate.ols_result,
     }
@@ -1525,33 +1970,183 @@ def build_top1_model_bundle(
     return bundle
 
 
+def resolve_run_datetime() -> Tuple[datetime, str]:
+    requested = os.getenv("USED_CAR_RUN_ID", "").strip()
+    if not requested:
+        value = datetime.now()
+        return value, value.strftime("%Y%m%d_%H%M%S")
+    if not re.fullmatch(r"\d{8}_\d{6}", requested):
+        raise ValueError("USED_CAR_RUN_ID must use YYYYMMDD_HHMMSS.")
+    try:
+        value = datetime.strptime(requested, "%Y%m%d_%H%M%S")
+    except ValueError as exc:
+        raise ValueError("USED_CAR_RUN_ID is not a valid date/time.") from exc
+    if value.strftime("%Y%m%d_%H%M%S") != requested:
+        raise ValueError("USED_CAR_RUN_ID did not round-trip exactly.")
+    return value, requested
+
+
+def planned_artifact_paths(pcs_date: pd.Timestamp, run_id: str) -> Dict[str, Path]:
+    date_folder = pcs_date.strftime("%Y%m%d")
+    train_dir = OUTPUT_DIR / date_folder
+    analysis_dir = OUTPUT_DIR.parent / "analysis" / date_folder
+    return {
+        "result": train_dir / f"OLS_REGRESSION_RESULT_{run_id}.csv",
+        "coefficient": train_dir / f"OLS_REGRESSION_COEFFICIENT_{run_id}.csv",
+        "joblib": train_dir / f"used_car_models_{run_id}.joblib",
+        "price_quality_all": analysis_dir / f"price_quality_all_{run_id}.csv",
+        "price_outliers": analysis_dir / f"price_outliers_for_review_{run_id}.csv",
+        "row_selection": analysis_dir / f"train_row_selection_{run_id}.csv",
+        "evaluation": analysis_dir / f"training_evaluation_{run_id}.csv",
+        "holdout_predictions": analysis_dir / f"holdout_predictions_{run_id}.csv",
+        "evaluation_metadata": analysis_dir / f"training_evaluation_metadata_{run_id}.json",
+    }
+
+
+def assert_no_artifact_collisions(paths: Dict[str, Path]) -> None:
+    collisions = [str(path) for path in paths.values() if path.exists()]
+    if collisions:
+        raise FileExistsError(
+            "RUN_ID would overwrite existing artifacts: " + ", ".join(collisions)
+        )
+
+
+def export_evaluation_sidecars(
+    paths: Dict[str, Path],
+    run_id: str,
+    pcs_date: pd.Timestamp,
+    ranked_checkpoints: Sequence[FinalCandidate],
+    holdout_metrics: dict,
+    holdout_predictions: pd.DataFrame,
+    split_metadata: dict,
+    fold_metadata: dict,
+    source_positive_count: int,
+    eligible_count: int,
+    candidate_outcomes: Sequence[dict],
+) -> None:
+    rows = []
+    for rank, candidate in enumerate(ranked_checkpoints, start=1):
+        rows.append({
+            "RECORD_TYPE": "CANDIDATE_SUMMARY",
+            "STAGE": "DEVELOPMENT_OOF",
+            "MODEL_RANK": rank,
+            "CANDIDATE_ID": candidate.candidate_id,
+            "ENCODING_PROFILE": candidate.encoding_profile,
+            "PRICE_BAND": None,
+            "N_OBSERVATION": candidate.cv_eligible_count,
+            "RMSE": candidate.cv_rmse,
+            "MAE": candidate.cv_mae,
+            "FOLD_RMSE_MEAN": candidate.cv_fold_rmse_mean,
+            "FOLD_RMSE_STD": candidate.cv_fold_rmse_std,
+            "FOLD_MAE_MEAN": candidate.cv_fold_mae_mean,
+            "FOLD_MAE_STD": candidate.cv_fold_mae_std,
+            "NEGATIVE_RATE": candidate.cv_negative_rate,
+            "MODEL_OTHER_COUNT": candidate.cv_other_count,
+            "MODEL_OTHER_DENOMINATOR": candidate.cv_other_denominator,
+            "MODEL_OTHER_RATE": candidate.cv_model_other_rate,
+        })
+        for band in candidate.cv_price_band_metrics:
+            rows.append({
+                "RECORD_TYPE": "PRICE_BAND",
+                "STAGE": "DEVELOPMENT_OOF",
+                "MODEL_RANK": rank,
+                "CANDIDATE_ID": candidate.candidate_id,
+                "ENCODING_PROFILE": candidate.encoding_profile,
+                "PRICE_BAND": band["price_band"],
+                "N_OBSERVATION": band["count"],
+                "RMSE": band["rmse"],
+                "MAE": band["mae"],
+            })
+    rows.append({
+        "RECORD_TYPE": "CANDIDATE_SUMMARY",
+        "STAGE": "HOLDOUT_TEST_DEVELOPMENT_CHECKPOINT",
+        "MODEL_RANK": 1,
+        "CANDIDATE_ID": ranked_checkpoints[0].candidate_id,
+        "ENCODING_PROFILE": ranked_checkpoints[0].encoding_profile,
+        "PRICE_BAND": None,
+        "N_OBSERVATION": holdout_metrics["count"],
+        "RMSE": holdout_metrics["rmse"],
+        "MAE": holdout_metrics["mae"],
+        "NEGATIVE_RATE": holdout_metrics["negative_rate"],
+        "MODEL_OTHER_COUNT": holdout_metrics["other_count"],
+        "MODEL_OTHER_DENOMINATOR": holdout_metrics["other_denominator"],
+        "MODEL_OTHER_RATE": holdout_metrics["other_rate"],
+    })
+    for band in holdout_metrics["price_band_metrics"]:
+        rows.append({
+            "RECORD_TYPE": "PRICE_BAND",
+            "STAGE": "HOLDOUT_TEST_DEVELOPMENT_CHECKPOINT",
+            "MODEL_RANK": 1,
+            "CANDIDATE_ID": ranked_checkpoints[0].candidate_id,
+            "ENCODING_PROFILE": ranked_checkpoints[0].encoding_profile,
+            "PRICE_BAND": band["price_band"],
+            "N_OBSERVATION": band["count"],
+            "RMSE": band["rmse"],
+            "MAE": band["mae"],
+        })
+    paths["evaluation"].parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(
+        paths["evaluation"], index=False, encoding="utf-8-sig"
+    )
+    holdout_predictions.to_csv(
+        paths["holdout_predictions"], index=False, encoding="utf-8-sig",
+        float_format="%.6f",
+    )
+    metadata = {
+        "training_evaluation_version": "V4",
+        "run_id": run_id,
+        "pcs_date": pcs_date.date().isoformat(),
+        "target": TARGET_COLUMN,
+        "eligible_cohort_rule": f"{TARGET_COLUMN} > {TARGET_PRICE_MIN_EXCLUSIVE_THB:g}",
+        "positive_target_rows": source_positive_count,
+        "eligible_rows": eligible_count,
+        "excluded_by_cohort_rule": source_positive_count - eligible_count,
+        "outlier_policy": "GROUP_BASED_SUSPECTED_OUTLIER_IS_FLAG_ONLY",
+        "development_holdout_split": split_metadata,
+        "development_cv_folds": fold_metadata,
+        "candidate_outcomes": list(candidate_outcomes),
+        "ranking": ["POOLED_OOF_RMSE", "POOLED_OOF_MAE", "CANDIDATE_ID"],
+        "holdout_evaluated_model_rank": 1,
+        "holdout_metrics_apply_to": "DEVELOPMENT_CHECKPOINT",
+        "exported_model_stage": "FULL_DATA_FROZEN_DESIGN_COEFFICIENT_REFIT",
+        "holdout_is_independent_test_of_exported_refit": False,
+        "principal_output_contract": {
+            "result_columns": len(RESULT_COLUMNS),
+            "coefficient_columns": len(COEFFICIENT_COLUMNS),
+            "joblib_rank": 1,
+        },
+    }
+    paths["evaluation_metadata"].write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 def main() -> None:
-    if PRICE_FILTER_MODE not in {"BASELINE", "EXPERIMENT"}:
-        raise ValueError("PRICE_FILTER_MODE must be BASELINE or EXPERIMENT.")
     if not 0.0 < CONFIDENCE_LEVEL < 1.0:
         raise ValueError("CONFIDENCE_LEVEL must be between 0 and 1 (exclusive).")
+    if not DB_PASSWORD:
+        raise RuntimeError("USED_CAR_DB_PASSWORD must be set in the environment.")
 
     warnings.filterwarnings(
         "ignore",
         message="covariance of constraints does not have full rank",
     )
 
-    run_datetime = datetime.now()
-    run_id = run_datetime.strftime("%Y%m%d_%H%M%S")
+    run_datetime, run_id = resolve_run_datetime()
 
     print("=" * 78)
-    print("USED CAR OLS TRAINING")
+    print("USED CAR OLS TRAINING EVALUATION V4")
     print("=" * 78)
-    print(f"[CONFIG] SQL Server : {DB_SERVER}:{DB_PORT} / {DB_DATABASE}")
+    print(f"[RUN] RUN_ID={run_id}")
     print(f"[CONFIG] Source     : {DB_SCHEMA}.{SOURCE_TABLE}")
     print(f"[CONFIG] Target     : {TARGET_COLUMN}")
+    print(f"[CONFIG] Cohort     : {TARGET_COLUMN} > {TARGET_PRICE_MIN_EXCLUSIVE_THB:,.0f} THB")
+    print(f"[CONFIG] Dev/Holdout: {1-HOLDOUT_FRACTION:.0%}/{HOLDOUT_FRACTION:.0%}")
     print(f"[CONFIG] TOP N      : {TOP_N_MODELS}")
     print(f"[CONFIG] P-value    : <= {P_VALUE_THRESHOLD}")
     print(f"[CONFIG] Confidence : {CONFIDENCE_LEVEL:.0%}")
     print(f"[CONFIG] CV folds   : {CV_FOLDS}")
-    print(f"[CONFIG] Price mode : {PRICE_FILTER_MODE}")
-    print(f"[CONFIG] Exclude <= : {PRICE_FILTER_MAX_THB:,.0f} THB (EXPERIMENT train only)")
-    print(f"[CONFIG] Confirmed bad IDs: {len(CONFIRMED_BAD_LISTING_IDS):,}")
     print(f"[CONFIG] Output base: {OUTPUT_DIR.resolve()}")
 
     engine = build_engine()
@@ -1572,41 +2167,50 @@ def main() -> None:
         f"[INFO] Snapshot PCS_DATE = {pcs_date.date().isoformat()}"
     )
 
+    paths = planned_artifact_paths(pcs_date, run_id)
+    assert_no_artifact_collisions(paths)
+
     # Price-quality screening is always informational: no suspected peer
     # outliers are removed just because they have a review flag.
     export_outlier_flag_only_reports(df, pcs_date, run_id)
 
-    df = clean_target(df)
-    df = maybe_convert_numeric_like_columns(df)
-
-    # Fixed CV splits are built from this FULL cleaned cohort in both modes.
-    # The experimental filter applies inside each CV train fold and final fit.
-    final_train_df, exclusion_reasons = select_train_rows(df)
-    export_train_row_selection_report(df, exclusion_reasons, pcs_date, run_id)
-    print(f"[PRICE FILTER] Full positive-price cohort: {len(df):,} rows")
-    print(f"[PRICE FILTER] Final-fit training rows : {len(final_train_df):,} rows")
-    print(f"[PRICE FILTER] Train-only excluded     : {len(df) - len(final_train_df):,} rows")
-    if PRICE_FILTER_MODE == "EXPERIMENT":
-        print("[PRICE FILTER] Validation retains ALL positive-price rows, including <=1,000 THB.")
+    cleaned_df = clean_target(df).reset_index(drop=True)
+    eligible_df, exclusion_reasons = select_eligible_cohort(cleaned_df)
+    # Learn identity components on the full positive-price snapshot. An
+    # ineligible row can still bridge two eligible duplicate listings.
+    duplicate_groups = build_duplicate_groups(cleaned_df).loc[eligible_df.index]
+    development_df, holdout_df, split_metadata = split_development_holdout(
+        eligible_df, duplicate_groups
+    )
+    common_folds, fold_metadata = build_common_cv_folds(
+        development_df, duplicate_groups.loc[development_df.index]
+    )
+    split_assignments = pd.Series("EXCLUDED", index=cleaned_df.index, dtype="string")
+    split_assignments.loc[development_df.index] = "DEVELOPMENT"
+    split_assignments.loc[holdout_df.index] = "HOLDOUT"
+    export_train_row_selection_report(
+        cleaned_df, exclusion_reasons, pcs_date, run_id, split_assignments
+    )
+    print(f"[COHORT] Positive-price rows : {len(cleaned_df):,}")
+    print(f"[COHORT] Eligible rows       : {len(eligible_df):,}")
+    print(f"[COHORT] Excluded <= 1,000   : {len(cleaned_df) - len(eligible_df):,}")
+    print(f"[SPLIT] Development/Holdout : {len(development_df):,}/{len(holdout_df):,}")
+    print(f"[SPLIT] Assignment checksum : {split_metadata['assignment_checksum']}")
+    print(f"[CV] Fold checksum          : {fold_metadata['assignment_checksum']}")
     print("[PRICE FILTER] Peer-group SUSPECTED_OUTLIER flags are review-only.")
 
-    eligible_features, excluded_info = infer_eligible_features(final_train_df)
+    candidate_universe = infer_candidate_universe(development_df)
 
     print(
-        f"[INFO] Eligible predictors ({len(eligible_features)}): "
-        + ", ".join(eligible_features)
+        f"[INFO] Candidate universe ({len(candidate_universe)}): "
+        + ", ".join(candidate_universe)
     )
 
-    if excluded_info:
-        print("[INFO] Excluded columns:")
-        for col, reason in excluded_info:
-            print(f"       - {col}: {reason}")
-
-    initial_candidates = build_candidate_experiments(eligible_features)
+    initial_candidates = build_candidate_experiments(candidate_universe)
     print("[INFO] Core vehicle features detected:",
-          [c for c in eligible_features if c.lower() in CORE_VEHICLE_FEATURES])
+          [c for c in candidate_universe if c.lower() in CORE_VEHICLE_FEATURES])
     print("[INFO] Optional sub-model detected:",
-          [c for c in eligible_features if c.lower() in OPTIONAL_VEHICLE_FEATURES])
+          [c for c in candidate_universe if c.lower() in OPTIONAL_VEHICLE_FEATURES])
     print("[INFO] Baseline category limits:", ENCODING_PROFILES["BASELINE"])
     print("[INFO] Expanded category limits:", ENCODING_PROFILES["EXPANDED_BRAND_MODEL"])
     print("[INFO] High-price cutoff (CV diagnostics only):", f"{HIGH_PRICE_MIN_THB:,.0f} THB")
@@ -1621,7 +2225,8 @@ def main() -> None:
         f"[INFO] Generated {len(initial_candidates)} candidate feature sets."
     )
 
-    fitted_candidates: List[FinalCandidate] = []
+    development_checkpoints: List[FinalCandidate] = []
+    candidate_outcomes: List[dict] = []
 
     paired_results = {}
     for candidate_id, experiment in enumerate(initial_candidates, start=1):
@@ -1633,61 +2238,67 @@ def main() -> None:
         )
 
         try:
-            (cv_rmse, cv_mae, tail_mae, negative_rate, model_other_rate,
-             eligible_rmse, eligible_mae, eligible_count) = evaluate_candidate_cv(
-                df, feature_set, profile,
+            evaluation = evaluate_candidate_cv(
+                development_df, feature_set, profile, folds=common_folds,
             )
 
-            final_candidate = fit_final_candidate(
-                df=final_train_df,
+            checkpoint = fit_final_candidate(
+                df=development_df,
                 candidate_id=candidate_id,
                 initial_source_features=feature_set,
-                cv_rmse=cv_rmse,
-                cv_mae=cv_mae,
+                cv_rmse=evaluation.rmse,
+                cv_mae=evaluation.mae,
                 encoding_profile=profile,
-                cv_high_price_mae=tail_mae,
-                cv_negative_rate=negative_rate,
-                cv_model_other_rate=model_other_rate,
-                cv_eligible_rmse=eligible_rmse,
-                cv_eligible_mae=eligible_mae,
-                cv_eligible_count=eligible_count,
+                cv_evaluation=evaluation,
             )
 
-            fitted_candidates.append(final_candidate)
-            paired_results[(tuple(feature_set), profile)] = final_candidate
+            development_checkpoints.append(checkpoint)
+            paired_results[(tuple(feature_set), profile)] = checkpoint
+            candidate_outcomes.append({
+                "candidate_id": candidate_id,
+                "encoding_profile": profile,
+                "status": "SUCCESS",
+                "failure_reason": None,
+            })
 
             print(
-                f"        CV_RMSE={cv_rmse:,.2f} | "
-                f"CV_MAE={cv_mae:,.2f} | "
-                f"Adj_R2={final_candidate.adj_r_squared:.6f} | "
+                f"        POOLED_OOF_RMSE={evaluation.rmse:,.2f} | "
+                f"POOLED_OOF_MAE={evaluation.mae:,.2f} | "
                 f"SelectedFeatures="
-                f"{len(final_candidate.selected_source_features)} | "
+                f"{len(checkpoint.selected_source_features)} | "
                 f"VehicleFeatures="
-                f"{[c for c in final_candidate.selected_source_features if c.lower() in CORE_VEHICLE_FEATURES + OPTIONAL_VEHICLE_FEATURES]}"
+                f"{[c for c in checkpoint.selected_source_features if c.lower() in CORE_VEHICLE_FEATURES + OPTIONAL_VEHICLE_FEATURES]}"
             )
             print(
-                f"        OOF eligible cohort (price > {PRICE_FILTER_MAX_THB:,.0f} THB): "
-                f"RMSE={eligible_rmse:,.2f} | MAE={eligible_mae:,.2f} "
-                f"| n={eligible_count:,} (not used for rank)"
+                f"        Fold RMSE mean/std={evaluation.fold_rmse_mean:,.2f}/"
+                f"{evaluation.fold_rmse_std:,.2f} | Fold MAE mean/std="
+                f"{evaluation.fold_mae_mean:,.2f}/{evaluation.fold_mae_std:,.2f}"
             )
             print(
                 f"        OOF MAE(>= {HIGH_PRICE_MIN_THB:,.0f}THB)="
-                f"{tail_mae if tail_mae is not None else float('nan'):,.0f} | "
-                f"OOF Negative={negative_rate:.2%} | "
-                f"OOF model=__OTHER__={model_other_rate:.2%}"
-                if model_other_rate is not None else
+                f"{evaluation.high_price_mae if evaluation.high_price_mae is not None else float('nan'):,.0f} | "
+                f"OOF Negative={evaluation.negative_rate:.2%} | "
+                f"OOF model=__OTHER__={evaluation.other_rate:.2%} "
+                f"({evaluation.other_count}/{evaluation.other_denominator})"
+                if evaluation.other_rate is not None else
                 f"        OOF MAE(>= {HIGH_PRICE_MIN_THB:,.0f}THB)="
-                f"{tail_mae if tail_mae is not None else float('nan'):,.0f} | "
-                f"OOF Negative={negative_rate:.2%} | OOF model category=N/A"
+                f"{evaluation.high_price_mae if evaluation.high_price_mae is not None else float('nan'):,.0f} | "
+                f"OOF Negative={evaluation.negative_rate:.2%} | OOF model category=N/A"
             )
 
         except Exception as exc:
+            candidate_outcomes.append({
+                "candidate_id": candidate_id,
+                "encoding_profile": profile,
+                "status": "FAILED",
+                "failure_reason": f"{type(exc).__name__}: {exc}",
+            })
             print(
                 f"[WARN] Candidate {candidate_id} skipped: {exc}"
             )
 
     print("\n[COMPARISON] Paired BASELINE vs EXPANDED (same feature sets and CV folds):")
-    for base_features in generate_candidate_feature_sets(eligible_features)[:MAX_EXPANDED_EXPERIMENTS]:
+    for base_features in generate_candidate_feature_sets(candidate_universe)[:MAX_EXPANDED_EXPERIMENTS]:
         b = paired_results.get((tuple(base_features), "BASELINE"))
         e = paired_results.get((tuple(base_features), "EXPANDED_BRAND_MODEL"))
         if b is not None and e is not None:
@@ -1697,30 +2308,43 @@ def main() -> None:
             print(f"  EXPANDED RMSE={e.cv_rmse:,.2f}, MAE={e.cv_mae:,.2f}, "
                   f"tail_MAE={e.cv_high_price_mae}, model_OTHER={e.cv_model_other_rate}")
 
-    if not fitted_candidates:
+    if not development_checkpoints:
         raise RuntimeError(
             "No candidate model completed successfully."
         )
 
-    ranked = rank_candidates(fitted_candidates)
+    ranked_checkpoints = rank_candidates(development_checkpoints)
 
-    if len(ranked) < TOP_N_MODELS:
+    if len(ranked_checkpoints) < TOP_N_MODELS:
         print(
-            f"[WARN] Only {len(ranked)} unique valid model structures were "
+            f"[WARN] Only {len(ranked_checkpoints)} unique valid model structures were "
             f"found; requested TOP_N_MODELS={TOP_N_MODELS}."
         )
 
-    top_candidates = ranked[:TOP_N_MODELS]
+    top_checkpoints = ranked_checkpoints[:TOP_N_MODELS]
+    holdout_metrics, holdout_predictions = evaluate_frozen_candidate(
+        top_checkpoints[0], holdout_df
+    )
+    print(
+        f"[HOLDOUT] Rank 1 Development checkpoint | "
+        f"RMSE={holdout_metrics['rmse']:,.2f} | "
+        f"MAE={holdout_metrics['mae']:,.2f} | n={holdout_metrics['count']:,}"
+    )
 
-    # Organize artifacts by the actual STG snapshot PCS_DATE (YYYYMMDD).
-    run_output_dir = OUTPUT_DIR / pcs_date.strftime("%Y%m%d")
-    run_output_dir.mkdir(parents=True, exist_ok=True)
+    top_candidates = [
+        refit_candidate_coefficients(checkpoint, eligible_df)
+        for checkpoint in top_checkpoints
+    ]
+    if any(int(candidate.ols_result.nobs) != len(eligible_df)
+           for candidate in top_candidates):
+        raise RuntimeError("Exported Full-data refit N_OBSERVATION mismatch.")
+
+    paths["result"].parent.mkdir(parents=True, exist_ok=True)
 
     result_df, model_ids = build_result_dataframe(
         top_candidates=top_candidates,
         run_datetime=run_datetime,
         pcs_date=pcs_date,
-        n_observation=len(final_train_df),
     )
 
     coefficient_df = build_coefficient_dataframe(
@@ -1729,26 +2353,13 @@ def main() -> None:
         pcs_date=pcs_date,
     )
 
-    result_path = (
-        run_output_dir
-        / f"OLS_REGRESSION_RESULT_{run_id}.csv"
-    )
-    coefficient_path = (
-        run_output_dir
-        / f"OLS_REGRESSION_COEFFICIENT_{run_id}.csv"
-    )
-    joblib_path = (
-        run_output_dir
-        / f"used_car_models_{run_id}.joblib"
-    )
-
     result_df.to_csv(
-        result_path,
+        paths["result"],
         index=False,
         encoding="utf-8-sig",
     )
     coefficient_df.to_csv(
-        coefficient_path,
+        paths["coefficient"],
         index=False,
         encoding="utf-8-sig",
     )
@@ -1765,8 +2376,22 @@ def main() -> None:
 
     joblib.dump(
         top1_bundle,
-        joblib_path,
+        paths["joblib"],
         compress=3,
+    )
+
+    export_evaluation_sidecars(
+        paths=paths,
+        run_id=run_id,
+        pcs_date=pcs_date,
+        ranked_checkpoints=ranked_checkpoints,
+        holdout_metrics=holdout_metrics,
+        holdout_predictions=holdout_predictions,
+        split_metadata=split_metadata,
+        fold_metadata=fold_metadata,
+        source_positive_count=len(cleaned_df),
+        eligible_count=len(eligible_df),
+        candidate_outcomes=candidate_outcomes,
     )
 
     print()
@@ -1789,7 +2414,7 @@ def main() -> None:
             + ", ".join(candidate.selected_source_features)
         )
         print(
-            f"         Shared eligible validation cohort: "
+            f"         Development OOF eligible cohort: "
             f"RMSE={candidate.cv_eligible_rmse:,.2f} | "
             f"MAE={candidate.cv_eligible_mae:,.2f} | "
             f"n={candidate.cv_eligible_count:,}"
@@ -1799,9 +2424,12 @@ def main() -> None:
     print("=" * 78)
     print("EXPORTED FILES")
     print("=" * 78)
-    print(f"1) {result_path}")
-    print(f"2) {coefficient_path}")
-    print(f"3) {joblib_path}  <-- Rank 1 only")
+    print(f"1) {paths['result']}")
+    print(f"2) {paths['coefficient']}")
+    print(f"3) {paths['joblib']}  <-- Rank 1 only")
+    print(f"4) {paths['evaluation']}")
+    print(f"5) {paths['holdout_predictions']}")
+    print(f"6) {paths['evaluation_metadata']}")
     print()
     print("[DONE] Training and export completed successfully.")
 

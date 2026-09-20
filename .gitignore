@@ -1,0 +1,19 @@
+.DS_Store
+**/.DS_Store
+
+.venv/
+__pycache__/
+*.py[cod]
+
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+logs/*.log
+
+# Generated models, row-level reports, predictions, and plots.
+output/
+
+# Local raw listing extracts must be reviewed before sharing.
+ONE2CAR/*.csv
